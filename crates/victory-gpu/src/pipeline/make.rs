@@ -76,12 +76,18 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        // Not `get_or_init`: a worker lost in it (a driver crash or a
+        // compile that never ends under Wine, see `library::Making`) would
+        // leave it locked for every other caller.
+        if self.made.get().is_none() {
             let began = Instant::now();
+            let me = this_thread();
+            MAKING_NOW.lock().unwrap_or_else(|e| e.into_inner()).push((me, std::ptr::from_ref(self) as usize));
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            MAKING_NOW.lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.0 != me);
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            made
-        });
+            let _ = self.made.set(made);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -420,10 +426,23 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
+            running |= spawn_worker(i, i >= workers);
+        }
+        running
+    })
+}
+
+/// Starts pipeline worker `i` (`screens_only`: it makes screen passes alone).
+fn spawn_worker(i: usize, screens_only: bool) -> bool {
+    {
+        {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
+                    WORKER_SCREENS.with(|w| w.set(screens_only));
+                    if screens_only {
+                        MAKING_SCREENS.lock().unwrap_or_else(|e| e.into_inner()).push(this_thread());
+                    }
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
@@ -437,6 +456,11 @@ fn workers() -> bool {
                     loop {
                         let p = next(screens_only);
                         p.make();
+                        if super::library::replaced() {
+                            // Another worker took this one's place (and
+                            // its count) while the driver held it.
+                            return;
+                        }
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -451,12 +475,51 @@ fn workers() -> bool {
                 });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
+                return false;
             }
+            true
         }
-        running
-    })
+    }
+}
+
+thread_local! {
+    /// Whether this worker makes screen passes alone.
+    static WORKER_SCREENS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pipeline each worker thread makes now (thread id, `&Pending`,
+/// whether the worker makes screen passes alone).
+static MAKING_NOW: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+static MAKING_SCREENS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn this_thread() -> u32 {
+    // SAFETY: a plain call.
+    unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// The worker `thread` is lost in the driver for good (its compiler crashed
+/// or never ends): its pipeline is made without a host pipeline, so no
+/// draw waits for it again, and another worker takes its place.
+pub(super) fn worker_lost(thread: u32) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+    let pending = MAKING_NOW.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|m| m.0 == thread).map(|m| m.1);
+    if let Some(p) = pending {
+        // SAFETY: the pipeline outlives its making (its title object holds
+        // it, and the worker still in the driver holds a reference).
+        let p = unsafe { &*(p as *const Pending) };
+        let _ = p.made.set(None);
+        if p.was_slow.load(Ordering::Relaxed) {
+            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            queue.slow_now = queue.slow_now.saturating_sub(1);
+            AVAILABLE.notify_all();
+        }
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+    let screens_only = MAKING_SCREENS.lock().unwrap_or_else(|e| e.into_inner()).contains(&thread);
+    WAITING.fetch_sub(1, Ordering::Relaxed);
+    spawn_worker(NEXT.fetch_add(1, Ordering::Relaxed), screens_only);
 }
 
 /// The most pipelines waiting at once since the workers last ran out.

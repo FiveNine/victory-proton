@@ -461,10 +461,24 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // An empty library is asked for with a null blob: an empty slice's
+        // pointer is dangling, which vkd3d-proton (Proton) rejects (after
+        // Slaktarn700 e5a8c2f).
+        let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr() };
+        let mut library: Option<ID3D12PipelineLibrary> = None;
+        // SAFETY: the bytes outlive the library (kept beside it); the out
+        // pointer is ours and typed by the interface id passed with it.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                data.cast(),
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                (&raw mut library).cast(),
+            )
+            .ok()?;
         }
+        library.ok_or_else(windows::core::Error::empty)?.cast()
     };
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
@@ -501,6 +515,215 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     })
 }
 
+/// Pipelines a driver's compiler crashed on (names, one per line).
+const CRASHED_FILE: &str = "crashed.txt";
+
+/// The pipeline named `name` is left out from the next run on.
+fn note_crashed(name: &str) {
+    use std::io::Write;
+    let Some(dir) = DIR.get() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(CRASHED_FILE));
+    if let Ok(mut f) = file {
+        // One write: threads that crash together do not interleave.
+        let _ = f.write_all(format!("{name}\n").as_bytes());
+    }
+}
+
+/// Whether the driver crashed making the pipeline named `name` before.
+fn crashed(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            DIR.get()
+                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        })
+        .contains(name)
+}
+
+thread_local! {
+    /// The pipeline the driver makes on this thread.
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The driver makes a pipeline on this thread. If its compiler crashes there
+/// (RADV under vkd3d-proton does on some of the title's shaders), the
+/// pipeline is noted and left out from then on, and the thread parked: the
+/// others, and the title, go on.
+struct Making;
+
+/// Pipelines the driver is making, by thread: name, since when, and
+/// whether the watch below has given up on it.
+static AT_WORK: Mutex<Vec<(u32, String, std::time::Instant, bool)>> = Mutex::new(Vec::new());
+
+/// A compile running longer than [`endless`] never ends here (RADV under Wine: the
+/// thread sleeps in the driver for minutes, 0 CPU): the pipeline is noted
+/// like a crash, and another worker takes the thread's place.
+// `VICTORY_PIPELINE_ENDLESS_S` (8): vkd3d-proton 3.x (Proton Experimental)
+// allocates without end in some of these (~0.3 GB/s each), so the thread
+// is also suspended (`VICTORY_PIPELINE_SUSPEND=0` leaves it running).
+fn endless() -> std::time::Duration {
+    static S: OnceLock<std::time::Duration> = OnceLock::new();
+    *S.get_or_init(|| {
+        let secs = std::env::var("VICTORY_PIPELINE_ENDLESS_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8);
+        std::time::Duration::from_secs(secs)
+    })
+}
+
+/// Stops a thread the driver will not give back.
+fn suspend(thread: u32) -> bool {
+    if std::env::var_os("VICTORY_PIPELINE_SUSPEND").is_some_and(|v| v == "0") {
+        return false;
+    }
+    use windows::Win32::System::Threading::{OpenThread, SuspendThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: a thread of ours, opened, suspended and closed.
+    unsafe {
+        let Ok(handle) = OpenThread(THREAD_SUSPEND_RESUME, false, thread) else { return false };
+        let ok = SuspendThread(handle) != u32::MAX;
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        ok
+    }
+}
+
+thread_local! {
+    /// This worker was replaced while it made a pipeline: it ends when
+    /// (if) the driver returns.
+    static WORKER_REPLACED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this worker thread was replaced (see [`ENDLESS`]) and must end.
+pub(super) fn replaced() -> bool {
+    WORKER_REPLACED.with(std::cell::Cell::get)
+}
+
+fn this_thread() -> u32 {
+    // SAFETY: a plain call.
+    unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+fn watch_endless() {
+    let _ = std::thread::Builder::new().name("victory-pipeline-endless".into()).spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let long: Vec<(u32, String)> = {
+            let mut work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            work.iter_mut()
+                .filter(|w| !w.3 && w.2.elapsed() > endless())
+                .map(|w| {
+                    w.3 = true;
+                    (w.0, w.1.clone())
+                })
+                .collect()
+        };
+        for (thread, name) in long {
+            let stopped = suspend(thread);
+            tracing::error!(name, stopped, "the driver's compiler does not end a pipeline: it is left out from the next run on, and another worker goes on");
+            note_crashed(&name);
+            super::make::worker_lost(thread);
+        }
+    });
+}
+
+impl Making {
+    fn new(name: &str) -> Making {
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: handlers that live as long as the process.
+        HANDLER.call_once(|| unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(
+                1,
+                Some(compiler_crashed),
+            );
+            // Under Wine a crash in the host driver's compiler comes back
+            // as a failed call that winevulkan asserts on: no dialog, and
+            // its abort or breakpoint is caught like a crash.
+            _set_error_mode(OUT_TO_STDERR);
+            signal(SIGABRT, compiler_aborted as *const () as usize);
+            watch_endless();
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((
+            this_thread(),
+            name.to_owned(),
+            std::time::Instant::now(),
+            false,
+        ));
+        Making
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.with(|m| m.borrow_mut().clear());
+        let me = this_thread();
+        let mut work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = work.iter().position(|w| w.0 == me) {
+            if work[at].3 {
+                WORKER_REPLACED.with(|r| r.set(true));
+            }
+            work.swap_remove(at);
+        }
+    }
+}
+
+const SIGABRT: i32 = 22;
+const OUT_TO_STDERR: i32 = 1;
+
+unsafe extern "C" {
+    fn signal(sig: i32, handler: usize) -> usize;
+    fn _set_error_mode(mode: i32) -> i32;
+}
+
+fn making() -> String {
+    MAKING.try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default()).unwrap_or_default()
+}
+
+/// Notes the pipeline this thread makes, hands its work to another worker
+/// and parks the thread for good.
+fn lost(name: &str, how: &str) -> ! {
+    tracing::error!(name, how, "the driver's compiler crashed making a pipeline: it is left out");
+    {
+        let me = this_thread();
+        AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != me);
+    }
+    note_crashed(name);
+    super::make::worker_lost(this_thread());
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    const BREAKPOINT: i32 = 0x8000_0003_u32 as i32;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let name = making();
+    // Only reads or writes of the first pages (our own guards' faults are
+    // elsewhere), or winevulkan's assert, which ends in a breakpoint.
+    let ours = !name.is_empty()
+        && (record.ExceptionCode == BREAKPOINT
+            || record.ExceptionCode == ACCESS_VIOLATION && record.ExceptionInformation[1] < 0x10000);
+    if !ours {
+        return 0;
+    }
+    lost(&name, "exception")
+}
+
+/// An abort on a thread making a pipeline: winevulkan's assert after the
+/// host driver's compiler crashed (Wine).
+extern "C" fn compiler_aborted(_sig: i32) {
+    let name = making();
+    if name.is_empty() {
+        return; // not ours: the abort goes on
+    }
+    // SAFETY: the handler is reset before it runs; it stays for the next.
+    unsafe { signal(SIGABRT, compiler_aborted as *const () as usize) };
+    lost(&name, "abort")
+}
+
 /// A pipeline's name in the library: the hash of what its host
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
@@ -520,6 +743,14 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    if crashed(name) {
+        // E_FAIL.
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+    }
+    let create = || {
+        let _making = Making::new(name);
+        create()
+    };
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
