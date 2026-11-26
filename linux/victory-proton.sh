@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Runs a VIctory build (Windows, Rust) under Proton on Linux.
+# Part of this repository (avatarmanz/VIctory-7900XTX + the Linux/Proton changes).
+# Tested with Proton Experimental (Wine 11, vkd3d-proton), RADV, RX 7900 XT,
+# Ryzen 7 5800X3D,
+# 32 GB: ~14-17 fps in the open world, ~14 fps in 11,000-draw views.
+#
+# Usage:  victory-proton.sh [extra args for `victory run`]
+# Every VICTORY_* / VKD3D_* / RADV_* variable you set yourself wins.
+#
+# Before the first run:
+#  - build the fork:  cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+#  - put a native d3dcompiler_47.dll (x64, e.g. from the Firefox 62 installer,
+#    as winetricks fetches it) at $D3DCOMPILER below. Wine's builtin cannot
+#    compile the fork's helper shaders: indirect draws are dropped, 3D is black.
+set -euo pipefail
+
+# --- Your paths ---------------------------------------------------------------
+REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"     # this checkout
+GAME_EXE="${GAME_EXE:-$HOME/games/xbox-dump/game.exe}" # your own copy's executable
+D3DCOMPILER="${D3DCOMPILER:-$HOME/victory-tools/d3dcompiler_47.dll}"
+PROTON="${PROTON:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/proton}"
+PREFIX="${PREFIX:-$HOME/.local/share/victory-prefix}"  # a Proton prefix of its own
+LOGDIR="${LOGDIR:-$HOME/victory-logs}"
+PROFILE="${VICTORY_PROFILE:-release}"                  # release or diag
+
+win() { echo "Z:${1//\//\\}"; }
+
+# --- The fork's fast settings (its scripts/play.ps1, non-safe mode) -----------
+for kv in VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
+    VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \
+    VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_TITLE_PRIORITIES=0 VICTORY_CARD_AWAKE=1 \
+    VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light VICTORY_SKIP_PIPELINES=none \
+    VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
+    VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_GUARD=1 VICTORY_PORT_JOURNAL=1 VICTORY_PORT_CBV=1 \
+    VICTORY_PORT_CONSTANTS=1 VICTORY_COPY_COMPARE=1 VICTORY_ONE_PAD=0; do
+    k=${kv%%=*}
+    [ -z "${!k+x}" ] && export "$kv"
+done
+
+# NOT RADV_DEBUG=hang: it turns on syncshaders, and the card becomes the
+# bottleneck (~205 ms GPU a frame, ~4 fps). Set it yourself only to get a hang
+# report (~/radv_dumps_*) when the GPU hangs.
+export RADV_DEBUG="${RADV_DEBUG-}"
+
+# Port 1 (VICTORY_PORT_CONSTANTS) needs this build's patch under Proton: without
+# it the picture is black (vkd3d-proton's heap-from-address only works on
+# anonymous memory; the patch backs the title's 32-bit heap with private pages).
+# VICTORY_ONE_PAD=0: the fork's keyboard stand-in pad is not merged with real
+# pads (an analog keyboard's gamepad mode would get every key twice).
+# Devices that pretend to be joysticks can steer on their own: list them as
+# SDL_GAMECONTROLLER_IGNORE_DEVICES=0xVID/0xPID,... (e.g. OpenTabletDriver's
+# virtual tablet is 0x0000/0x0000).
+export SDL_GAMECONTROLLER_IGNORE_DEVICES="${SDL_GAMECONTROLLER_IGNORE_DEVICES-0x0000/0x0000}"
+export SDL_JOYSTICK_IGNORE_DEVICES="${SDL_JOYSTICK_IGNORE_DEVICES-$SDL_GAMECONTROLLER_IGNORE_DEVICES}"
+
+# --- Proton -------------------------------------------------------------------
+export STEAM_COMPAT_DATA_PATH="$PREFIX"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/.local/share/Steam}"
+export WINEDLLOVERRIDES="d3dcompiler_47=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+# vkd3d-proton keeps its pipeline cache in the working directory otherwise.
+export VKD3D_SHADER_CACHE_PATH="$PREFIX/vkd3d-cache"
+mkdir -p "$PREFIX" "$VKD3D_SHADER_CACHE_PATH" "$LOGDIR"
+
+# Optional overlay: VICTORY_HUD=1 with MangoHud installed.
+if [ "${VICTORY_HUD:-0}" != 0 ]; then export MANGOHUD=1; fi
+
+# --- Run ----------------------------------------------------------------------
+stamp=$(date +%Y%m%d-%H%M%S)
+log="$LOGDIR/run-$stamp.txt"
+echo "log: $log ($PROFILE build)"
+cd "$REPO"
+cp -u "$D3DCOMPILER" "target/x86_64-pc-windows-msvc/$PROFILE/"
+# Without a terminal the exe dies on its first println: its output goes
+# through cmd /c into the log file instead.
+exec "$PROTON" run cmd /c "target\\x86_64-pc-windows-msvc\\$PROFILE\\victory.exe run $(win "$GAME_EXE") --execute $* > $(win "$log") 2>&1"
