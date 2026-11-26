@@ -3650,6 +3650,17 @@ impl<'a> Lower<'a> {
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
+        // What found it, in the two bits above the page's 24: a store (bit
+        // 31), a program that traces rays (bit 30).
+        let marks = u32::from(store) << 31 | u32::from(self.traces_rays()) << 30;
+        let noted = if marks != 0 {
+            let marks = k(self, marks);
+            let c = self.cur;
+            self.s.m.bin(c, Bin::Or, page, marks)
+        } else {
+            page
+        };
+        let c = self.cur;
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
@@ -3658,7 +3669,7 @@ impl<'a> Lower<'a> {
             Attr::NoUnwind,
             void,
             140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            &[faults, place, iu, noted, iu, iu, iu, mask, align],
         );
         self.end_guarded(noting, &[]);
         let c = self.cur;

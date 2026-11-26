@@ -106,6 +106,47 @@ const BACK: u64 = 256 << 10;
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+
+/// Pages taken from the faults that are held at a time, at most: past it the
+/// oldest of them is given back (it comes again if a shader still reads it).
+/// With [`FAULTS_ALL`] alone the builder found 240-600 pages a frame empty
+/// for the rest of the run, read zeros there and built structures with
+/// holes: the ray-traced light pulsed from frame to frame (2026-11-27, runs
+/// dense against densefault: frame-to-frame change 1.93 against 0.64, 0.80
+/// without rays), and taking them all filled the 3 GiB in a minute and the
+/// card with it. `VICTORY_FAULT_BUDGET=<pages>` (0: the old cap in all).
+///
+/// Two queues (as 2Q): a page comes on probation (a quarter of the budget);
+/// one that faults again after it was given back from there is kept on the
+/// other queue (the rest). Pages the builder reads once, at addresses that
+/// move from frame to frame, pass through probation without pushing out
+/// those it reads every frame: with one queue of 8,192 pages everything was
+/// given back and taken again (106,000 in 150 s) and the light pulsed more.
+fn fault_budget() -> usize {
+    static SET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_FAULT_BUDGET").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Pages given back from probation that are remembered, at most.
+const GHOSTS: usize = 1 << 16;
+
+/// Frames a page given back waits before its place holds another: lists
+/// recorded with the old entry may still be on their way.
+const COOL: u64 = 6;
+
+/// [`FAULTS`] and [`FAULTS_ALL`], or `VICTORY_FAULT_CAPS=<a frame>,<in all>`.
+fn fault_caps() -> (usize, usize) {
+    static SET: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_FAULT_CAPS").unwrap_or_default();
+        let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
+        let caps = (n.next().flatten().unwrap_or(FAULTS), n.next().flatten().unwrap_or(FAULTS_ALL));
+        if caps != (FAULTS, FAULTS_ALL) {
+            tracing::info!(frame = caps.0, all = caps.1, "title memory by address: pages taken from the faults");
+        }
+        caps
+    })
+}
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -171,6 +212,16 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
+    /// Those held now, oldest first ([`fault_budget`]): on probation, kept.
+    fault_pages: std::collections::VecDeque<u64>,
+    fault_kept: std::collections::VecDeque<u64>,
+    /// Pages given back from probation, remembered (and in order).
+    ghosts: std::collections::HashSet<u64>,
+    ghost_order: std::collections::VecDeque<u64>,
+    /// Places given back, free from the frame named.
+    cooling: std::collections::VecDeque<(u64, usize, usize)>,
+    /// Pages given back for the budget.
+    evicted: u64,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -203,6 +254,9 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Faults by what found them: loads, loads of programs that trace rays,
+    /// stores, stores of such programs.
+    kinds: [u64; 4],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -250,6 +304,12 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
+            fault_pages: std::collections::VecDeque::new(),
+            fault_kept: std::collections::VecDeque::new(),
+            ghosts: std::collections::HashSet::new(),
+            ghost_order: std::collections::VecDeque::new(),
+            cooling: std::collections::VecDeque::new(),
+            evicted: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -663,8 +723,11 @@ impl Memory {
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
-            let page = unsafe { at.read_volatile() };
-            if page != 0 {
+            let noted = unsafe { at.read_volatile() };
+            if noted != 0 {
+                // (The shader's marks: a store, a program that traces rays.)
+                self.stats.kinds[(noted >> 30) as usize] += 1;
+                let page = noted & 0x3FFF_FFFF;
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -675,10 +738,31 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let budget = fault_budget();
+        while self.cooling.front().is_some_and(|c| c.0 <= self.frame) {
+            let (_, copy, at) = self.cooling.pop_front().unwrap();
+            self.free.push((copy, at));
+        }
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            let (frame_cap, all_cap) = fault_caps();
+            if made >= frame_cap || (budget == 0 && self.faulted >= all_cap) || self.copy_of(page).is_some() {
+                continue;
+            }
+            let again = budget > 0 && self.ghosts.remove(&page);
+            if budget > 0 {
+                let probation = (budget / 4).max(1);
+                if again {
+                    while self.fault_kept.len() >= budget - probation && self.give_back_oldest(true) {}
+                } else {
+                    while self.fault_pages.len() >= probation && self.give_back_oldest(false) {}
+                }
+            }
+            if self.map(page) {
                 made += 1;
                 self.faulted += 1;
+                if budget > 0 && self.pages.contains_key(&page) {
+                    if again { self.fault_kept.push_back(page) } else { self.fault_pages.push_back(page) }
+                }
                 self.bring(page, page + 1);
             }
         }
@@ -701,6 +785,36 @@ impl Memory {
                 "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
             );
         }
+    }
+
+    /// Gives back the oldest page taken from the faults that nothing else
+    /// holds; false if there is none.
+    fn give_back_oldest(&mut self, kept: bool) -> bool {
+        loop {
+            let Some(page) = (if kept { self.fault_kept.pop_front() } else { self.fault_pages.pop_front() }) else {
+                break;
+            };
+            let Some(held) = self.pages.get(&page) else { continue };
+            if held.owners > 0 {
+                continue;
+            }
+            let (copy, at) = (held.copy, held.at);
+            self.pages.remove(&page);
+            // SAFETY: an entry of the directory, under the mutex.
+            unsafe { self.entry(page).write_volatile(0) };
+            self.cooling.push_back((self.frame + COOL, copy, at));
+            self.evicted += 1;
+            if !kept && self.ghosts.insert(page) {
+                self.ghost_order.push_back(page);
+                while self.ghost_order.len() > GHOSTS {
+                    if let Some(old) = self.ghost_order.pop_front() {
+                        self.ghosts.remove(&old);
+                    }
+                }
+            }
+            return true;
+        }
+        false
     }
 
     /// The structures named in a list's upload memory around `address`
@@ -765,7 +879,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -787,7 +901,13 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            self.fault_pages.len() + self.fault_kept.len(),
+            self.evicted,
+            s.kinds[0] as f64 / frames,
+            s.kinds[1] as f64 / frames,
+            s.kinds[2] as f64 / frames,
+            s.kinds[3] as f64 / frames
         );
         self.stats.from = Some((now, self.frame));
     }
