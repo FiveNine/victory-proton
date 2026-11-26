@@ -1321,7 +1321,45 @@ static PLACEHOLDERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new())
 
 /// The runtime reserved `[at, at + len)` for the title as a placeholder,
 /// into which only views (or allocations) come.
+/// `VICTORY_LOCK_PROBE=1` (diagnostics): a thread asks the host about one
+/// address every millisecond and says every 5 s how long the answers took.
+/// The host's memory calls share one lock under Wine, so this is how long
+/// a mapping call of the title's waits for it.
+pub fn lock_probe() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if std::env::var_os("VICTORY_LOCK_PROBE").is_none_or(|v| v != "1") {
+        return;
+    }
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-lock-probe".into()).spawn(|| {
+            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+            static HERE: u8 = 0;
+            let mut since = std::time::Instant::now();
+            let (mut n, mut sum, mut most, mut over) = (0u64, 0u64, 0u64, 0u64);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                let t = std::time::Instant::now();
+                // SAFETY: a valid out pointer of the right size.
+                unsafe { VirtualQuery((&raw const HERE).cast(), &mut info, size_of_val(&info)) };
+                let us = t.elapsed().as_micros() as u64;
+                n += 1;
+                sum += us;
+                most = most.max(us);
+                over += u64::from(us >= 100);
+                if since.elapsed() >= std::time::Duration::from_secs(5) {
+                    tracing::info!(n, mean_us = sum / n.max(1), most_us = most, over_100us = over, "lock probe");
+                    (n, sum, most, over) = (0, 0, 0, 0);
+                    since = std::time::Instant::now();
+                }
+            }
+        });
+    });
+}
+
 pub fn title_placeholder_reserved(at: usize, len: usize) {
+    lock_probe();
     if len != 0 {
         PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, at.saturating_add(len));
     }
