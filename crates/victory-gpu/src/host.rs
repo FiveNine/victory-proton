@@ -9738,6 +9738,13 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    /// Ticks per second of the drawing queue's timestamps.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timestamp_frequency(&self) -> Option<u64> {
+        // SAFETY: a plain query of a live queue.
+        unsafe { self.queue.GetTimestampFrequency() }.ok()
+    }
+
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
