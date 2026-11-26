@@ -2,7 +2,7 @@
 
 Tested on one machine: Arch Linux, KDE Plasma (Wayland), Ryzen 9 9950X3D,
 30 GB RAM, Radeon RX 9070 XT (RADV, Mesa 26.3), GE-Proton10-34, the Series X
-profile. Branch `linux-proton` of this repository.
+profile. This repository.
 
 ## What is needed
 

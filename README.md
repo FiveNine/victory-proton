@@ -1,25 +1,12 @@
-# VIctory on an RX 7900 XTX
+# victory-proton
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+[VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs
+an Xbox Series title from files the user supplies, running on **Linux under
+Proton**, ray tracing included.
 
-## The goal
-
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
-
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
-
-**On Linux:** this branch (`linux-proton`) runs it under Proton on an RX 9070
-XT, ray tracing included (~17-20 fps in the prologue with it on, ~27 off).
-How to set it up, the wineserver patch it needs for streaming, and what was
-changed for it: [linux/README.md](linux/README.md).
+Built on [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+(its original README: [docs/README-7900XTX-fork.md](docs/README-7900XTX-fork.md)),
+with the changes Linux needed and a much faster ray-tracing path.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
@@ -27,116 +14,61 @@ or publisher.
 
 ## Where it stands (2026-11-26)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, the Series X profile, ray tracing off.
+Tested on one machine: Arch Linux, KDE Plasma (Wayland), Ryzen 9 9950X3D,
+30 GB RAM, Radeon RX 9070 XT (RADV, Mesa 26.3), GE-Proton10-34, 4K output,
+the Series X profile.
 
-| | |
-|---|---|
-| City street, renderer patches 1+2 on | about 53 ms a frame (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 35 GB of private memory: **64 GB of RAM recommended** for now |
+| | Ray tracing off | Ray tracing on |
+|---|---|---|
+| Prologue, first scene (prison) | ~27 fps | ~17-20 fps |
+| First in-world cinematic | ~21 fps | ~13 fps |
 
-It started at 280 ms a frame in the same scenes three days earlier.
+At the start of the day ray tracing ran at 2-3 fps in the world and ~5 in the
+cinematic, and streaming stalled the cinematic at 2-8 fps even without it.
+With ray tracing off some ~340 draws a frame that need it are left out, so
+ray tracing on is the complete picture.
 
-### Renderer patches (off by default while they are tested)
+What changed:
 
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
+- **Streaming:** Wine's server kept a process's memory views in a list that
+  every map walked under Wine's memory lock; the title has tens of thousands
+  of streamed 64 KiB views. [A wineserver patch](linux/wineserver-views-rbtree.patch)
+  (as upstream Wine `3217449b1f`, in no Proton release yet): a page map
+  294 -> 13 us, the cinematic 2-8 -> 15-28 fps. The runtime also records its
+  own placeholder reservations (`473d815`): Wine has no
+  `NtQueryVirtualMemory` class 7, and the failing test cost 10,000 queries a
+  frame under the same lock.
+- **Ray tracing**, where the console's hardware node test is emulated in
+  shaders:
+  - `5e013ab`: a node is read in four 16-byte loads instead of 28 single
+    dwords (vkd3d-proton only vectorizes a raw load whose offset is visibly
+    `(x << 4) + 16k`).
+  - `8eaee79`, `91184ce`: a node, and each access to title memory by address,
+    runs once per copy the wave's lanes name, with that copy's view the
+    wave's. Given per lane, RADV put every load in a loop of its own around a
+    descriptor read, one after another.
+  - `2baa1dd`, `f81abde`: walks through ray-tracing structures stop after
+    1,024 steps (rays sent into broken structures walked 4,096 and held their
+    waves) and end with what they found instead of leaving the program
+    without writing their pixel.
+- `1390a72`: 16-bit data of integer views in descriptor tables keeps its bits.
+- Diagnostics: `VICTORY_GPU_PROFILE=1` (GPU time by pipeline),
+  `VICTORY_LOCK_PROBE=1`, `VICTORY_RT_SKIP=1`.
 
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+Known wrong: NPCs' mouths do not move when they talk; the splash video
+judders; some reflections are still off (parts of the title's ray-tracing
+structures are missing, 600-2,000 pages a frame); lighting is not right
+everywhere yet. The CPU side of the memory emulation (~30 ms preparing,
+~24 ms copying back a frame) limits both modes now.
 
 ## How to run it
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
-
-```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
-```
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
-
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
-
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
-
-## Credits
-
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+See [linux/README.md](linux/README.md): what to build and install
+(this code built for Windows with `cargo xwin`, GE-Proton with the wineserver
+patch, vkd3d-proton from master, Microsoft's `d3dcompiler_47.dll`), and
+[linux/run-victory.sh](linux/run-victory.sh), which sets up the rest.
+Ray tracing: `VICTORY_BVH_BUILDER=1 ./run-victory.sh`.
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, as VIctory ([LICENSE](LICENSE)).
