@@ -113,6 +113,13 @@ export VICTORY_PIPELINE_WAIT_MS="${VICTORY_PIPELINE_WAIT_MS:-50}"
 # cinematic went 2.3 -> 7.6 fps with 0, and 20.9 -> 21.9 fps without it
 # (2026-11-26).
 export VICTORY_SHADER_LOOP_LIMIT="${VICTORY_SHADER_LOOP_LIMIT:-0}"
+# Memory caps (2026-11-26): a 10-minute session with ray tracing ran the
+# card's 16 GB and the 15 GB of system memory it may use both full ("Not
+# enough memory for command submission", device lost). Copies of title
+# memory outside buffers had grown 4.3 -> 8.6 GB in four minutes, and the
+# ray-tracing structures' memory on the card may take 4 GB.
+export VICTORY_WINDOW_BUDGET_MB="${VICTORY_WINDOW_BUDGET_MB:-4096}"
+export VICTORY_MEMORY_CARD_MB="${VICTORY_MEMORY_CARD_MB:-2048}"
 # vkd3d-proton master's VK_EXT_descriptor_heap path stays on: it gives a
 # 2,097,152-view heap (1,000,000 without it), so the 7900XTX fork's
 # per-draw tables are not refused (~1,500 indirect draws a frame were

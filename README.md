@@ -21,6 +21,7 @@ the Series X profile.
 | | Ray tracing off | Ray tracing on |
 |---|---|---|
 | Prologue, first scene (prison) | ~27 fps | ~17-20 fps |
+| Open world, first boat ride | | ~20-25 fps |
 | First in-world cinematic | ~21 fps | ~13 fps |
 
 At the start of the day ray tracing ran at 2-3 fps in the world and ~5 in the
@@ -51,6 +52,12 @@ What changed:
     1,024 steps (rays sent into broken structures walked 4,096 and held their
     waves) and end with what they found instead of leaving the program
     without writing their pixel.
+- `6eb38e3`: programs that trace rays store a NaN as 0 (black blocks spread
+  over reflections on windows, framed pictures and floors).
+- Merged avatarmanz's main again and, from [Belobug's AMD fork](https://github.com/Belobug/VIctory-Belobug-AMD)
+  (an RX 9070 XT build like this one): streamed textures capped only when VRAM
+  is over 92 % full, a pooled indirect buffer, descriptor slots given back
+  sooner (scenes of 10,000+ draws), the texture upload fix for flicker, its HUD.
 - `1390a72`: 16-bit data of integer views in descriptor tables keeps its bits.
 - Diagnostics: `VICTORY_GPU_PROFILE=1` (GPU time by pipeline),
   `VICTORY_LOCK_PROBE=1`, `VICTORY_RT_SKIP=1`.
