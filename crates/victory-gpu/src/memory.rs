@@ -849,6 +849,15 @@ fn close(entry: *mut u32, n: usize, offset: u64) {
 
 /// The offset first: a shader that sees the number sees it too.
 fn fill(entry: *mut u32, n: usize, offset: u64) {
+    // The ray-tracing node test reads a node's 16-byte quarters as such
+    // (`victory_shader::emit` `bvh_node_words`): a page on less than 16
+    // bytes in its copy would read the wrong bytes there.
+    if offset % 16 != 0 {
+        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            tracing::warn!(offset, "a page of title memory lies on less than 16 bytes in its copy");
+        }
+    }
     // SAFETY: an entry of the directory, under the mutex.
     unsafe {
         entry.add(1).write_volatile(offset as u32);

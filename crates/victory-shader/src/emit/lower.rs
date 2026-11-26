@@ -3573,6 +3573,13 @@ impl<'a> Lower<'a> {
     /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
     /// is the null view.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
+        let (slot, byte) = self.memory_slot(lo, hi, guard, store);
+        (self.memory_handle(slot), byte)
+    }
+
+    /// [`Self::memory`] up to the heap slot of the copy's view: the slot
+    /// and the byte in the view. Goes on in another block.
+    pub(super) fn memory_slot(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -3643,14 +3650,18 @@ impl<'a> Lower<'a> {
         };
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        (slot, byte)
+    }
+
+    /// The raw view at heap slot `slot` of [`Self::memory_slot`].
+    pub(super) fn memory_handle(&mut self, slot: V) -> V {
+        // The builder's threads read what others of the dispatch wrote (a
+        // refit climbs from children to parents): globally coherent.
+        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000 | coherent, 0))
     }
 
     /// The title address in the root view `src` is built around, in a program
