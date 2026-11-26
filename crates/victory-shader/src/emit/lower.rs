@@ -395,6 +395,8 @@ struct Lower<'a> {
     /// Loop headers whose loops walk ray-tracing structures (a node test
     /// between the header and its last back edge, in reverse postorder).
     walks: HashMap<usize, (usize, usize)>,
+    /// Whether the program traces rays ([`Self::traces_rays`]), once known.
+    rays: Option<bool>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The one block the program returns from: every `s_endpgm` branches
@@ -2155,6 +2157,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             walks: HashMap::new(),
+            rays: None,
             abort: None,
             ret: None,
         }
@@ -4488,6 +4491,15 @@ impl<'a> Lower<'a> {
 
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
     /// drivers (such as NVIDIA) do not fold `fcmp uno` away under fast-math.
+    /// Whether the program has a ray-tracing node test.
+    fn traces_rays(&mut self) -> bool {
+        if self.rays.is_none() {
+            let p = self.x.p;
+            self.rays = Some(p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))));
+        }
+        self.rays == Some(true)
+    }
+
     fn is_nan_f32(&mut self, f: V) -> V {
         let c = self.cur;
         let bits = self.as_int(f);
@@ -11640,6 +11652,18 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+            }
+            // In programs that trace rays, a NaN is stored as 0. A ray's
+            // hit read from a page of title memory the host had no copy of
+            // (zeros: a normal of length 0) gave NaNs, which the title's
+            // filters after the trace spread into black blocks over
+            // reflections. A 0 stays one dark pixel the filters hide.
+            if self.traces_rays() {
+                let zero = self.s.m.f32(0);
+                for v in &mut vals {
+                    let nan = self.is_nan_f32(*v);
+                    *v = self.s.m.select(self.cur, nan, zero, *v);
+                }
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
