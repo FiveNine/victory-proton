@@ -394,7 +394,7 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// Loop headers whose loops walk ray-tracing structures (a node test
     /// between the header and its last back edge, in reverse postorder).
-    walks: std::collections::HashSet<usize>,
+    walks: HashMap<usize, (usize, usize)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The one block the program returns from: every `s_endpgm` branches
@@ -2154,7 +2154,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
-            walks: std::collections::HashSet::new(),
+            walks: HashMap::new(),
             abort: None,
             ret: None,
         }
@@ -2812,7 +2812,7 @@ impl<'a> Lower<'a> {
                         && p.blocks[q].insts.iter().any(|i| i.name().starts_with("image_bvh"))
                 });
                 if walks {
-                    self.walks.insert(b);
+                    self.walks.insert(b, (self.rpo[b], last));
                 }
             }
         }
@@ -13212,7 +13212,9 @@ impl<'a> Lower<'a> {
             // A walk through a ray-tracing structure that is not over after
             // so many steps is one through a structure that is not right
             // (pointers into memory that holds no nodes).
-            LOOP_LIMIT if self.walks.contains(&to) => super::walk_limit(),
+            // (Past its limit a walk is given misses and so ends of itself
+            // ([`Self::walk_over`]); this is for one that does not.)
+            LOOP_LIMIT if self.walks.contains_key(&to) => super::walk_limit().saturating_mul(4),
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,
@@ -13227,6 +13229,27 @@ impl<'a> Lower<'a> {
         let over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
         over
+    }
+
+    /// For a node test in native block `b`: whether the innermost walk
+    /// through a ray-tracing structure it is in (`walks`) has taken
+    /// [`super::walk_limit`] steps. From there on the test finds nothing, so
+    /// the title's walk empties its stack and ends with what it found: a
+    /// lane stopped by the loop limit left the program without writing its
+    /// result (reflections kept what their pixels held before).
+    pub(super) fn walk_over(&mut self, b: usize) -> Option<V> {
+        let at = *self.rpo.get(b)?;
+        let (&header, _) = self
+            .walks
+            .iter()
+            .filter(|&(_, &(lo, hi))| lo <= at && at <= hi)
+            .max_by_key(|&(_, &(lo, _))| lo)?;
+        let count = self.counters.get(&header)?.0;
+        let limit = self.s.m.i32(super::walk_limit());
+        let c = self.cur;
+        let over = self.s.m.cmp(c, pred::IUGE, count, limit);
+        self.s.m.tag(over, Tag::Counter);
+        Some(over)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

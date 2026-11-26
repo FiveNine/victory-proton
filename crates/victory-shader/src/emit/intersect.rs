@@ -175,8 +175,33 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
+        // A walk past its limit ([`Lower::walk_over`]): the test is not
+        // made; no child of a box is entered, no triangle hit, so the walk
+        // empties its stack and ends with what it found.
+        let over = self.walk_over(b);
+        let c = self.cur;
+        let (k4o, k6o) = (self.s.m.i32(4), self.s.m.i32(6));
+        let pair_o = self.s.m.bin(c, Bin::And, pointer, k6o);
+        let box_o = self.s.m.cmp(c, pred::EQ, pair_o, k4o);
+        let outside: Vec<V> = (0..4)
+            .map(|k| {
+                let none = self.s.m.i32(bvh::NONE);
+                let miss = self.s.m.i32(bvh::MISS[k].to_bits());
+                self.s.m.select(c, box_o, none, miss)
+            })
+            .collect();
+        let gate_on = match (guard, over) {
+            (g, None) => g,
+            (g, Some(over)) => {
+                let on = self.s.m.bool(true);
+                let go = self.s.m.bin(c, Bin::Xor, over, on);
+                Some(match g {
+                    Some(g) => self.s.m.bin(c, Bin::And, g, go),
+                    None => go,
+                })
+            }
+        };
+        let gate = self.begin_guarded(gate_on);
         // Lanes whose nodes are in one copy go together, once per copy, as
         // the console's own waterfalls do: with the copy's view known to be
         // the wave's, the host reads its descriptor once for all the node's
@@ -248,7 +273,7 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            results.push((phi, outside[k]));
         }
         if waterfall {
             // (Out of the waterfall's loop: reached from its body alone.)
