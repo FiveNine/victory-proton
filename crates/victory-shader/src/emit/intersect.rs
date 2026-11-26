@@ -184,7 +184,9 @@ impl<'a> Lower<'a> {
         // around every load, in a loop of its own each (most of a trace's
         // time on the card); the nodes of a structure are mostly in one copy.
         let mut at = at;
-        let waterfall = if let NodeAt::Memory { slot, low, high, byte, mapped, .. } = at {
+        // (Not in pixel shaders: helper lanes may take no part in wave
+        // operations; see [`Lower::memory_waterfall`].)
+        let waterfall = if let (NodeAt::Memory { slot, low, high, byte, mapped, .. }, false) = (at, self.s.pixel) {
             let (header, body, back) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
             let c = self.cur;
             self.s.m.terminate(c, Term::Br(header));
