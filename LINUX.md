@@ -77,6 +77,10 @@ faster. `VICTORY_HUD=1 ./linux/victory-proton.sh` shows a MangoHud overlay.
 
 ## Settings that matter
 
+- **Optional: a wineserver with a view tree** ([`linux/wineserver/`](linux/wineserver/)). The stock server
+  walks all of the process's views on every map and unmap; with the title's tens of thousands of views
+  that was 11-24 % of all CPU samples here. Patched, on GE-Proton11-14: 8.3 -> 17.7 fps, write watch
+  17-26 -> 4.6 ms. It has to be built against your Proton's own Wine.
 - **Do not set `RADV_DEBUG=hang`.** It turns on syncshaders and makes the GPU the
   bottleneck: ~205 ms of GPU time a frame, about 4 fps.
 - The script turns on the fork's renderer ports 1, 2, 5, 6 and 7
