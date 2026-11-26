@@ -3,7 +3,7 @@
 # Part of this repository (avatarmanz/VIctory-7900XTX + the Linux/Proton changes).
 # Tested with Proton Experimental (Wine 11, vkd3d-proton), RADV, RX 7900 XT,
 # Ryzen 7 5800X3D,
-# 32 GB: ~14-17 fps in the open world, ~14 fps in 11,000-draw views.
+# 32 GB: ~16-17 fps in the open world, ~12-15 fps in 10,000+ draw views.
 #
 # Usage:  victory-proton.sh [extra args for `victory run`]
 # Every VICTORY_* / VKD3D_* / RADV_* variable you set yourself wins.
@@ -33,7 +33,7 @@ for kv in VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_
     VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light VICTORY_SKIP_PIPELINES=none \
     VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
     VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_GUARD=1 VICTORY_PORT_JOURNAL=1 VICTORY_PORT_CBV=1 \
-    VICTORY_PORT_CONSTANTS=1 VICTORY_COPY_COMPARE=1 VICTORY_ONE_PAD=0; do
+    VICTORY_PORT_CONSTANTS=1 VICTORY_COPY_COMPARE=1 VICTORY_ONE_PAD=0 VICTORY_FRAME_INTERVAL_MS=0; do
     k=${kv%%=*}
     [ -z "${!k+x}" ] && export "$kv"
 done
@@ -46,6 +46,8 @@ export RADV_DEBUG="${RADV_DEBUG-}"
 # Port 1 (VICTORY_PORT_CONSTANTS) needs this build's patch under Proton: without
 # it the picture is black (vkd3d-proton's heap-from-address only works on
 # anonymous memory; the patch backs the title's 32-bit heap with private pages).
+# VICTORY_FRAME_INTERVAL_MS=0: the title's own 30 fps cap off (frame and sim
+# rate patched to "no limit"; plays normally). 33.333 puts the cap back.
 # VICTORY_ONE_PAD=0: the fork's keyboard stand-in pad is not merged with real
 # pads (an analog keyboard's gamepad mode would get every key twice).
 # Devices that pretend to be joysticks can steer on their own: list them as

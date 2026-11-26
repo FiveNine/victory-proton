@@ -13,11 +13,14 @@ Experimental, and this repository makes that work and keeps it fast.
 |---|---|
 | Tested on | RX 7900 XT 20 GB, Ryzen 7 5800X3D, 32 GB RAM, Proton Experimental 11.0, Mesa/RADV |
 | Menus, videos | 30 fps (the title's cap) |
-| Open world | **~14-17 fps** (60-70 ms a frame) |
-| Very heavy views (~11,000 draws) | ~14 fps |
+| Open world (5,000-8,000 draws) | **~16-17 fps** (59-63 ms a frame) |
+| Very heavy views (10,000+ draws) | ~12-15 fps |
+| Processor | all 16 threads of a 5800X3D at 65-80 % |
 | Stability | long sessions without GPU hangs; saving and loading work |
 
 Not tested: NVIDIA (proprietary or NVK), Intel, AMD cards other than RDNA 3.
+**On Windows** use [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+with its `scripts\play.ps1` (and a page file of 32 GB or more with 32 GB of RAM).
 
 ## What this repository changes for Linux
 
@@ -78,7 +81,9 @@ faster. `VICTORY_HUD=1 ./linux/victory-proton.sh` shows a MangoHud overlay.
   bottleneck: ~205 ms of GPU time a frame, about 4 fps.
 - The script turns on the fork's renderer ports 1, 2, 5, 6 and 7
   (`VICTORY_PORT_CONSTANTS`, `_DESCRIPTORS`, `_CBV`, `_GUARD`, `_JOURNAL`):
-  ~11 -> ~16 fps here.
+  ~11 -> ~16 fps here, and 4-7 -> 14-15 fps in the heaviest views (port 1).
+- `VICTORY_FRAME_INTERVAL_MS=0`: the title's own 30 fps cap is off (menus and
+  cutscenes go above 30; the game logic is not tied to it). `33.333` puts it back.
 - `VICTORY_ONE_PAD=0`: the fork's keyboard stand-in pad is not merged with real pads
   (an analog keyboard's gamepad mode would get every key twice).
 - Devices that pretend to be joysticks (drawing tablets, analog keyboards) can steer
@@ -103,7 +108,13 @@ Logs are in `LOGDIR` (default `~/victory-logs/run-*.txt`).
 
 - The picture can wash out (too bright) now and then for a while.
 - The intro can flicker.
-- RAM: 32 GB is tight; close big applications.
+- RAM: 32 GB is tight; close big applications. The process commits 30-40 GB;
+  on Linux that needs swap (16 GB or more is a good idea).
+- VRAM: 15-18 GB used on a 20 GB card. 12 GB cards will likely run out; try
+  `VICTORY_CARD_BUFFERS_MB=512` and `--console series-s`.
+- Measured and not kept here: `VICTORY_INPLACE=1` (~1,100 ms a frame under Proton:
+  the GPU reads title memory over PCIe), `VICTORY_SUBMIT_FRAMES=2`,
+  `VICTORY_GUARD_REST=100000`, more helper threads.
 
 ## License and credits
 
