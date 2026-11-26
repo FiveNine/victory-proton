@@ -73,7 +73,11 @@ fi
 # (2026-11-26: world 21.9 -> 23.0-23.8 fps over five and two runs).
 if [ "$FORK" = victory-7900xtx ]; then
   unset VICTORY_PRESENT_TARGET VICTORY_HAIR
-  export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES_7900:-none}"
+  # The title's "dummy" ray-tracing resolves (shader_binning_utils:
+  # CS_DummyResolve, three variants) wrote black over the ray-traced
+  # lighting and reflections here: rooms far too dark, black tiles on
+  # windows and pictures (2026-11-27, interrogation scene). Left out.
+  export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES_7900:-44a9625f01769f33,38b8a084895dbeae,a9c43aa1a29e7b32}"
   for kv in TEXTURE_NO_WAIT=1 RELAY=2 WIDE_BACK=1 CARD_REHASH_RUNS=1 JOIN_COPIES=1 \
             INDIRECT_WINDOW=1 RELAY_COPY=1 CARD_STEPS=2 INDIRECT_BATCH=2 MAP_THREADS=1 \
             TITLE_PRIORITIES=0 CARD_AWAKE=1 SHOW_AFTER=1 AMBIENT=0.8 D3D12_DRED=light \
@@ -120,6 +124,11 @@ export VICTORY_SHADER_LOOP_LIMIT="${VICTORY_SHADER_LOOP_LIMIT:-0}"
 # ray-tracing structures' memory on the card may take 4 GB.
 export VICTORY_WINDOW_BUDGET_MB="${VICTORY_WINDOW_BUDGET_MB:-4096}"
 export VICTORY_MEMORY_CARD_MB="${VICTORY_MEMORY_CARD_MB:-2048}"
+# Output 1080p rendered at 1080p (the title's own: 4K rendered at 1440p).
+# 200 s with ray tracing: 22.5 fps against 20.0, the heavy last part 22.2
+# against 14.6. VICTORY_OUTPUT=3840x2160 VICTORY_RENDER_SCALE=0.6667 for 4K.
+export VICTORY_OUTPUT="${VICTORY_OUTPUT:-1920x1080}"
+export VICTORY_RENDER_SCALE="${VICTORY_RENDER_SCALE:-1.0}"
 # vkd3d-proton master's VK_EXT_descriptor_heap path stays on: it gives a
 # 2,097,152-view heap (1,000,000 without it), so the 7900XTX fork's
 # per-draw tables are not refused (~1,500 indirect draws a frame were
