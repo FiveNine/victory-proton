@@ -73,11 +73,10 @@ fi
 # (2026-11-26: world 21.9 -> 23.0-23.8 fps over five and two runs).
 if [ "$FORK" = victory-7900xtx ]; then
   unset VICTORY_PRESENT_TARGET VICTORY_HAIR
-  # The title's "dummy" ray-tracing resolves (shader_binning_utils:
-  # CS_DummyResolve, three variants) wrote black over the ray-traced
-  # lighting and reflections here: rooms far too dark, black tiles on
-  # windows and pictures (2026-11-27, interrogation scene). Left out.
-  export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES_7900:-44a9625f01769f33,38b8a084895dbeae,a9c43aa1a29e7b32}"
+  # (Leaving out the title's dummy ray-tracing resolves, CS_DummyResolve
+  # 44a9625f01769f33,38b8a084895dbeae,a9c43aa1a29e7b32, changed nothing
+  # measurable in the dark interrogation room, 2026-11-27.)
+  export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES_7900:-none}"
   for kv in TEXTURE_NO_WAIT=1 RELAY=2 WIDE_BACK=1 CARD_REHASH_RUNS=1 JOIN_COPIES=1 \
             INDIRECT_WINDOW=1 RELAY_COPY=1 CARD_STEPS=2 INDIRECT_BATCH=2 MAP_THREADS=1 \
             TITLE_PRIORITIES=0 CARD_AWAKE=1 SHOW_AFTER=1 AMBIENT=0.8 D3D12_DRED=light \
