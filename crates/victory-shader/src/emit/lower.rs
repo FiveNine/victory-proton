@@ -392,6 +392,9 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Loop headers whose loops walk ray-tracing structures (a node test
+    /// between the header and its last back edge, in reverse postorder).
+    walks: std::collections::HashSet<usize>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The one block the program returns from: every `s_endpgm` branches
@@ -2151,6 +2154,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            walks: std::collections::HashSet::new(),
             abort: None,
             ret: None,
         }
@@ -2796,6 +2800,20 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                let last = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter(|&&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q])
+                    .map(|&q| self.rpo[q])
+                    .max()
+                    .unwrap_or(self.rpo[b]);
+                let walks = order.iter().any(|&q| {
+                    (self.rpo[b]..=last).contains(&self.rpo[q])
+                        && p.blocks[q].insts.iter().any(|i| i.name().starts_with("image_bvh"))
+                });
+                if walks {
+                    self.walks.insert(b);
+                }
             }
         }
         self.cur = self.s.entry;
@@ -13191,6 +13209,10 @@ impl<'a> Lower<'a> {
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
         let limit = match super::loop_limit() {
+            // A walk through a ray-tracing structure that is not over after
+            // so many steps is one through a structure that is not right
+            // (pointers into memory that holds no nodes).
+            LOOP_LIMIT if self.walks.contains(&to) => super::walk_limit(),
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,

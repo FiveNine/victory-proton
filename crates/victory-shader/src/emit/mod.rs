@@ -315,6 +315,28 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
+/// The iteration count after which a loop that walks a ray-tracing
+/// structure is left (`lower.rs` `walks`), unless `VICTORY_SHADER_LOOP_LIMIT`
+/// sets every limit: `VICTORY_WALK_LIMIT` (diagnostics builds), else
+/// [`DEFAULT_WALK_LIMIT`]. Part of the translation.
+///
+/// Rays sent through structures the builder did not get right (pointers
+/// into memory that holds no nodes: 600-2,000 such pages a frame) walked
+/// on to the limit of other compute loops, 4,096 steps, and held their
+/// whole wave there. RT, RX 9070 XT, 2026-11-26: cinematic 10.6 -> 13.6 fps
+/// at 1,024 (15.0 at 512), the world after it 15.9 -> 19.4.
+pub const DEFAULT_WALK_LIMIT: u32 = 1 << 10;
+
+pub fn walk_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let asked = cfg!(feature = "diagnostics")
+            .then(|| std::env::var("VICTORY_WALK_LIMIT").ok().and_then(|v| v.trim().parse::<u32>().ok()))
+            .flatten();
+        asked.filter(|&n| n > 0).unwrap_or(DEFAULT_WALK_LIMIT)
+    })
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
