@@ -24,6 +24,13 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// The same table as [`SLOT_STRIDES`], bound for a shader that asks the
+/// format kind of views in its descriptor tables (`RootType::Table`), not
+/// of views it picks from the heap: the host binds it without the pass over
+/// the heap's buffer views that [`SLOT_STRIDES`] asks for. (After
+/// codec-d/cool_fox f4b48ad: the title's `compute_graph_ops` facial and
+/// wrapped-mesh solver reads 16-bit data of integer views through tables.)
+pub const SLOT_TABLE_STRIDES: u8 = 252;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format

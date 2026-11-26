@@ -1780,6 +1780,27 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_TABLE_STRIDES {
+                        // Ours: the shader asks the format kind of views in
+                        // its tables, which the table by heap slot holds
+                        // already; no pass over the heap's buffers.
+                        match self.heap_strides(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => {
+                                once!("a shader asks view kinds of its tables with no view heap set");
+                                self.bind_zero_view(list, param, compute, true);
+                            }
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -2091,6 +2112,27 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// The GPU address of the bound view heap's table of strides and format
+    /// kinds by slot ([`victory_shader::emit::SLOT_TABLE_STRIDES`]), held by
+    /// `list`, without the pass over the heap's buffer views.
+    fn heap_strides(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.strides_gpu()?;
+        // (Tag 2: apart from `heap_buffers`' `| 1`.)
+        if list.first_use(gpu as usize | 2)
+            && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps

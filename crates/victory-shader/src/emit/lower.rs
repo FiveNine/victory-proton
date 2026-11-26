@@ -8107,7 +8107,7 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
-        let word = self.slot_word(src)?;
+        let word = self.slot_word(src, false)?;
         Ok(word.map(|word| {
             let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
             self.s.m.bin(self.cur, Bin::And, word, bits)
@@ -8115,10 +8115,10 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the typed buffer view `src` names is one of an integer format,
-    /// and whether a signed one, as [`Self::slot_stride`] (`None`: a view the
-    /// program does not pick from the heap).
+    /// and whether a signed one: of views the program picks from the heap,
+    /// or of views in its descriptor tables (`None`: neither).
     fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
-        let Some(word) = self.slot_word(src)? else {
+        let Some(word) = self.slot_word(src, true)? else {
             return Ok(None);
         };
         let c = self.cur;
@@ -8132,19 +8132,18 @@ impl<'a> Lower<'a> {
     }
 
     /// The host's word for the buffer view `src` names: its stride and
-    /// format kind ([`super::shader::SLOT_STRIDES`]).
-    fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
+    /// format kind ([`super::shader::SLOT_STRIDES`] for views picked from the
+    /// heap; with `tables`, [`super::shader::SLOT_TABLE_STRIDES`] for views in
+    /// descriptor tables too, whose words the host keeps by the same slots).
+    fn slot_word(&mut self, src: &Source, tables: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
-        let heap = self
-            .scalar
-            .get(load)
-            .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
-        if !heap {
-            return Ok(None);
-        }
+        let table = match self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param)).map(|p| p.root) {
+            Some(RootType::ResourceHeap) => super::shader::SLOT_STRIDES,
+            Some(RootType::Table) if tables => super::shader::SLOT_TABLE_STRIDES,
+            _ => return Ok(None),
+        };
         let key = (self.cur, *load, *first);
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
@@ -8159,7 +8158,7 @@ impl<'a> Lower<'a> {
         self.s.m.tag(slot, Tag::Clamp);
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
-        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let h = self.s.root_srv_handle(table);
         let iu = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
         let align = self.s.m.i32(4);
