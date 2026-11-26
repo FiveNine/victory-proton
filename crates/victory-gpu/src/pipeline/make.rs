@@ -43,6 +43,8 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Why no host pipeline is made for it at all ([`left_out`]).
+    left_out: Option<&'static str>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -59,7 +61,16 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let left_out = left_out(&shaders);
+        if let Some(why) = left_out {
+            static LEFT: AtomicU64 = AtomicU64::new(0);
+            let n = LEFT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, why, "pipelines left out so far");
+            }
+        }
         Pending {
+            left_out,
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
@@ -93,6 +104,35 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Whether a compute shader of `shaders` is the title's program `name`.
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders.iter().any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// Pipelines not made at all: the title's ray-tracing passes that shade hits
+/// or start rays, while no acceleration structures are built
+/// (`VICTORY_BVH_BUILDER` unset). Without them they find nothing, and some
+/// thousand `CS_RaytracingResolve` programs stood in the compile queue on a
+/// cold cache ahead of what draws need (after codec-d/cool_fox 8cc31ab).
+/// Opt-in, `VICTORY_RT_SKIP=1`: on 2026-11-26 it left out 512-1,023
+/// pipelines of a run with no change in frame rate (25.3 fps in the world
+/// either way), and what the passes' outputs hold then was not looked at.
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    let skip = *SKIP.get_or_init(|| {
+        std::env::var_os("VICTORY_RT_SKIP").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+    });
+    let (resolve, activate) = (skip, skip);
+    if resolve && named(shaders, b"CS_RaytracingResolve") {
+        return Some("shades ray-tracing hits without acceleration structures");
+    }
+    if activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("starts rays without acceleration structures");
+    }
+    None
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -166,6 +206,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -181,6 +224,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -188,6 +234,9 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    if p.left_out.is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
