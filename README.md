@@ -16,6 +16,11 @@ into a versioned store that is kept between builds. Ray tracing stays optional
 and off by default. The picture comes after the frame rate: texture pop-in and
 lighting that is too bright or too dark when walking indoors are next in line.
 
+**On Linux:** this branch (`linux-proton`) runs it under Proton on an RX 9070
+XT, ray tracing included (~17-20 fps in the prologue with it on, ~27 off).
+How to set it up, the wineserver patch it needs for streaming, and what was
+changed for it: [linux/README.md](linux/README.md).
+
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
