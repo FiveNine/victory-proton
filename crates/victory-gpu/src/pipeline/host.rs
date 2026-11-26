@@ -634,7 +634,12 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            // vkd3d-proton's name for the shader's dumps (FNV-1 64 of the
+            // DXIL, `VKD3D_SHADER_DUMP_PATH`), to find them.
+            let dumped = stages.first().and_then(|(s, _)| s.translated()).map_or(0, |t| {
+                t.host.dxil.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| h.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(b))
+            });
+            tracing::info!(?shaders, vkd3d = format_args!("{dumped:016x}"), "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
