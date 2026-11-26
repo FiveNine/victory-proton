@@ -80,6 +80,7 @@ impl Pending {
         // compile that never ends under Wine, see `library::Making`) would
         // leave it locked for every other caller.
         if self.made.get().is_none() {
+            let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let me = this_thread();
             MAKING_NOW.lock().unwrap_or_else(|e| e.into_inner()).push((me, std::ptr::from_ref(self) as usize));
@@ -232,6 +233,7 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -244,6 +246,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    waiting.end();
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
