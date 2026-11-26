@@ -724,6 +724,51 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     list.fill_scratch(address as *const u8, len)
 }
 
+/// A 64 KiB buffer of zeros, bound where a root constant buffer or root
+/// view has no host address (the title did not set it, or it lies outside
+/// every title buffer). Left unset, the host passes address 0, and on RADV
+/// (vkd3d-proton) the shader's scalar loads from it are a GPU page fault
+/// that removes the device; zeros are what a null view reads.
+fn zero_view() -> Option<u64> {
+    struct Zeros(ID3D12Resource);
+    // SAFETY: D3D12 resources are free-threaded.
+    unsafe impl Send for Zeros {}
+    // SAFETY: as above.
+    unsafe impl Sync for Zeros {}
+    static ZEROS: std::sync::OnceLock<Option<Zeros>> = std::sync::OnceLock::new();
+    let zeros = ZEROS.get_or_init(|| {
+        const SIZE: u64 = 1 << 16;
+        let device = &crate::host::host()?.device;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: SIZE,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of an upload buffer, then filling it.
+        unsafe {
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer)
+                .ok()?;
+            let buffer = buffer?;
+            let mut data = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut data)).ok()?;
+            std::ptr::write_bytes(data.cast::<u8>(), 0, SIZE as usize);
+            buffer.Unmap(0, None);
+            tracing::info!("a zero buffer stands in for root views without a host address");
+            Some(Zeros(buffer))
+        }
+    });
+    // SAFETY: a live buffer.
+    zeros.as_ref().map(|z| unsafe { z.0.GetGPUVirtualAddress() })
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1567,6 +1612,9 @@ impl State {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
+                        if memory.is_none() {
+                            self.bind_zero_view(list, param, compute, true);
+                        }
                         if let Some(m) = &memory {
                             // SAFETY: an open list; the directory lives as
                             // long as the process and the list holds it.
@@ -1593,7 +1641,10 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set");
+                                self.bind_zero_view(list, param, compute, true);
+                            }
                         }
                         continue;
                     }
@@ -1604,6 +1655,9 @@ impl State {
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
+                        }
+                        if !tabled {
+                            self.bind_zero_view(list, param, compute, srv);
                         }
                         continue;
                     };
@@ -1620,6 +1674,8 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        once!(slot, "a shader reads a root view outside title buffers: zeros");
+                        self.bind_zero_view(list, param, compute, srv);
                         continue;
                     };
                     if biased {
@@ -1674,6 +1730,21 @@ impl State {
         // twins hold what they lack from here on.
         list.twins_written();
         true
+    }
+
+    /// Binds [`zero_view`] as the root constant buffer or view `param`.
+    fn bind_zero_view(&self, list: &HostList, param: u32, compute: bool, srv: bool) {
+        let Some(gpu) = zero_view() else { return };
+        let l = &list.list;
+        // SAFETY: an open list; the buffer lives as long as the process.
+        unsafe {
+            match (compute, srv) {
+                (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+                (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+            }
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
