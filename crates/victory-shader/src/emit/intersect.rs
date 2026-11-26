@@ -177,6 +177,37 @@ impl<'a> Lower<'a> {
         };
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
+        // Lanes whose nodes are in one copy go together, once per copy, as
+        // the console's own waterfalls do: with the copy's view known to be
+        // the wave's, the host reads its descriptor once for all the node's
+        // loads. Given the view per lane, it read the descriptor again
+        // around every load, in a loop of its own each (most of a trace's
+        // time on the card); the nodes of a structure are mostly in one copy.
+        let mut at = at;
+        let waterfall = if let NodeAt::Memory { slot, low, high, byte, mapped, .. } = at {
+            let (header, body, back) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+            let c = self.cur;
+            self.s.m.terminate(c, Term::Br(header));
+            self.s.flags |= flags::WAVE_OPS;
+            let i32t = self.s.t.i32;
+            let first = self.s.op(header, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[slot]);
+            let mine = self.s.m.cmp(header, pred::EQ, slot, first);
+            self.s.m.terminate(header, Term::CondBr(mine, body, back));
+            self.s.m.terminate(back, Term::Br(header));
+            self.cur = body;
+            let handle = self.bvh_handle(first, false);
+            at = NodeAt::Memory {
+                slot: first,
+                handle,
+                byte,
+                low,
+                high,
+                mapped,
+            };
+            true
+        } else {
+            false
+        };
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
@@ -217,6 +248,13 @@ impl<'a> Lower<'a> {
             );
             results.push((phi, zero));
         }
+        if waterfall {
+            // (Out of the waterfall's loop: reached from its body alone.)
+            let exit = self.s.m.new_block();
+            let c = self.cur;
+            self.s.m.terminate(c, Term::Br(exit));
+            self.cur = exit;
+        }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
@@ -253,68 +291,66 @@ impl<'a> Lower<'a> {
         (handle, byte, mapped, slot)
     }
 
-    /// The second half of a 128-byte node at `low`/`high` whose first half is
-    /// at `byte` of the view at `handle`: in the same view 64 bytes on, but
-    /// for a node in the last 64 bytes of its page, whose second half is in
-    /// the next page, looked up ([`Lower::memory`]). Most nodes need no
-    /// second look then. Goes on in another block.
-    fn bvh_memory_next(&mut self, low: V, high: V, byte: V, mapped: V, first: V) -> (V, V, V, V) {
+    /// The view at heap slot `slot` of title memory ([`Lower::memory_handle_at`]).
+    fn bvh_handle(&mut self, slot: V, nonuniform: bool) -> V {
         #[cfg(test)]
         if TEST_MEMORY.get().is_some() {
-            let (low, high) = self.address_plus(low, high, 64);
-            return self.bvh_memory(low, high, None);
+            return self.s.heap_handle(self.cur, slot, false, false, (11, 0));
         }
+        self.memory_handle_at(slot, nonuniform)
+    }
+
+    /// The 12 dwords of boxes of the second 64 bytes of a 128-byte node,
+    /// and whether their page has a copy. For a node in title memory: in
+    /// the same view 64 bytes on, but for a node in the last 64 bytes of its
+    /// page, whose second half is in the next page, looked up
+    /// ([`Lower::memory`]) and read with a view per lane. Goes on in
+    /// another block.
+    fn bvh_second_half(&mut self, at: NodeAt) -> (Vec<V>, Option<V>) {
+        let NodeAt::Memory { low, high, byte, mapped, handle, slot } = at else {
+            let NodeAt::Buffer { handle, byte } = at else { unreachable!() };
+            let size = self.s.m.i32(64);
+            let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
+            return (self.bvh_node_words(NodeAt::Buffer { handle, byte }, None, 0, 12), None);
+        };
         let head = self.cur;
         let (edge, k64) = (self.s.m.i32(0xFFC0), self.s.m.i32(64));
         let bits = self.s.m.bin(head, Bin::And, low, edge);
         let crosses = self.s.m.cmp(head, pred::EQ, bits, edge);
-        let near = self.s.m.bin(head, Bin::Add, byte, k64);
-        let (look, join) = (self.s.m.new_block(), self.s.m.new_block());
-        // (Slots are joined, not handles: a handle cannot be a phi.)
-        self.s.m.terminate(head, Term::CondBr(crosses, look, join));
+        let (look, same, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(head, Term::CondBr(crosses, look, same));
+        self.cur = same;
+        let near = self.s.m.bin(same, Bin::Add, byte, k64);
+        let here = NodeAt::Memory { low, high, byte: near, mapped, handle, slot };
+        let near_words = self.bvh_node_words(here, None, 0, 12);
+        let same_end = self.cur;
+        self.s.m.terminate(same_end, Term::Br(join));
         self.cur = look;
         let (next_low, next_high) = self.address_plus(low, high, 64);
-        let (slot, next_byte) = self.memory_slot(next_low, next_high, None, false);
-        let next_mapped = self.page_there.expect("memory says");
+        let (_, next_byte, next_mapped, next_slot) = self.bvh_memory(next_low, next_high, None);
+        let next_handle = self.bvh_handle(next_slot, true);
+        let next = NodeAt::Memory {
+            low: next_low,
+            high: next_high,
+            byte: next_byte,
+            mapped: next_mapped,
+            handle: next_handle,
+            slot: next_slot,
+        };
+        let far_words = self.bvh_node_words(next, None, 0, 12);
         let look_end = self.cur;
         self.s.m.terminate(look_end, Term::Br(join));
         self.cur = join;
         let (i32t, i1t) = (self.s.t.i32, self.s.m.type_of(mapped));
-        let phi = |l: &mut Self, ty, far: V, here: V| {
-            let p = l.s.m.phi(join, ty);
-            l.s.m.set_phi(p, vec![(far, look_end), (here, head)]);
-            p
-        };
-        let slot = phi(self, i32t, slot, first);
-        let byte = phi(self, i32t, next_byte, near);
-        let mapped = phi(self, i1t, next_mapped, mapped);
-        let handle = self.memory_handle(slot);
-        (handle, byte, mapped, slot)
-    }
-
-    /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
-    /// their own maybe. Goes on in another block.
-    fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
-        match at {
-            NodeAt::Buffer { handle, byte } => {
-                let size = self.s.m.i32(64);
-                let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
-                NodeAt::Buffer { handle, byte }
-            }
-            NodeAt::Memory { low, high, byte, mapped, slot, .. } => {
-                // Every lane in this block runs the instruction.
-                let (handle, byte, mapped, slot) = self.bvh_memory_next(low, high, byte, mapped, slot);
-                let (low, high) = self.address_plus(low, high, 64);
-                NodeAt::Memory {
-                    handle,
-                    byte,
-                    low,
-                    high,
-                    mapped,
-                    slot,
-                }
-            }
+        let mut words = Vec::with_capacity(12);
+        for (&far, &near) in far_words.iter().zip(&near_words) {
+            let p = self.s.m.phi(join, i32t);
+            self.s.m.set_phi(p, vec![(far, look_end), (near, same_end)]);
+            words.push(p);
         }
+        let there = self.s.m.phi(join, i1t);
+        self.s.m.set_phi(there, vec![(next_mapped, look_end), (mapped, same_end)]);
+        (words, Some(there))
     }
 
     /// `count` dwords of 64 bytes of a node from their byte `base` + `offset`
@@ -407,8 +443,8 @@ impl<'a> Lower<'a> {
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
         let mut words = self.bvh_node_words(at, None, 16, 12);
-        let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
+        let (more, second_there) = self.bvh_second_half(at);
+        words.extend(more);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         // (The look for the second half goes on in another block.)
         let wide_block = self.cur;
@@ -439,8 +475,8 @@ impl<'a> Lower<'a> {
         // A page that is not there reads zeros, which are a child and a box:
         // no child of it is hit. (The last two boxes of a 128-byte node are in
         // its second half.)
-        let there = match (at, second) {
-            (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
+        let there = match (at, second_there) {
+            (NodeAt::Memory { mapped: first, .. }, Some(last)) => {
                 let i1t = self.s.m.type_of(first);
                 let mapped = self.s.m.phi(join, i1t);
                 self.s

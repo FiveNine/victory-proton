@@ -3658,10 +3658,16 @@ impl<'a> Lower<'a> {
 
     /// The raw view at heap slot `slot` of [`Self::memory_slot`].
     pub(super) fn memory_handle(&mut self, slot: V) -> V {
+        self.memory_handle_at(slot, true)
+    }
+
+    /// [`Self::memory_handle`]; `nonuniform`: lanes may name other slots
+    /// (a slot the wave shares, from `WaveReadLaneFirst`, is not).
+    pub(super) fn memory_handle_at(&mut self, slot: V, nonuniform: bool) -> V {
         // The builder's threads read what others of the dispatch wrote (a
         // refit climbs from children to parents): globally coherent.
         let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
-        self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000 | coherent, 0))
+        self.s.heap_handle(self.cur, slot, false, nonuniform, (11 | 0x1000 | coherent, 0))
     }
 
     /// The title address in the root view `src` is built around, in a program
