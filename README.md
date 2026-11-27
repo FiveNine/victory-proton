@@ -14,6 +14,30 @@ runs (`linux/launcher.sh`, `linux/s70.sh`), FSR 4 and frame generation with AMD'
 FidelityFX DLLs in `linux/keep/fidelityfx/`. The tree before it is on the
 `linux-proton` branch.
 
+### Keyboard and mouse
+
+On by default (`VICTORY_KBM_PC=0`: the old controller-style keys). The mouse
+looks around as soon as the game window has the focus; Esc, P or F2 let it go,
+a click in the window takes it again (`VICTORY_MOUSE_SENS`,
+`VICTORY_MOUSE_INVERT_Y=1`, `VICTORY_MOUSE_AUTO=0` for F2 / `~` only).
+
+| Key | On foot | Driving keys (F or F5) |
+|---|---|---|
+| W A S D | move | steer; W throttle (RT), S brake / reverse (LT) |
+| Mouse | look | look |
+| Left / right button | attack (RT) / aim (LT) | same |
+| Space | jump, climb (X) | handbrake (RB) |
+| Shift | sprint (A) | |
+| F | enter / leave vehicle (Y); turns the driving keys over | |
+| R | reload, melee (B) | |
+| Q / Tab | cover (RB) / weapon wheel (LB) | |
+| Ctrl / C, middle button | crouch (L3) / look behind (R3) | |
+| E / G / M / Z | interact / D-pad left / phone / D-pad down | |
+| V / Esc, P / Enter, Backspace | camera / pause / confirm, back (menus) | |
+
+The pad cannot tell walking from driving: F flips the driving keys when you
+get in or out, F5 flips them by hand if they are out of step.
+
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.

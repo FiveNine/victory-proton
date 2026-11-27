@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -136,13 +136,29 @@ fn parse_env_flag(value: &str) -> bool {
     )
 }
 
-/// PC-style keyboard + mouse stand-in pad (`VICTORY_KBM_PC=1`).
-/// Off by default so the existing keyboard table and tests stay unchanged.
+/// PC-style keyboard + mouse stand-in pad: on by default
+/// (`VICTORY_KBM_PC=0`: the plain controller-style table, I/J/K/L look, Z/C triggers).
 fn pc_kbm() -> bool {
     static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("VICTORY_KBM_PC").is_ok_and(|v| parse_env_flag(&v)));
+        LazyLock::new(|| std::env::var("VICTORY_KBM_PC").map_or(true, |v| parse_env_flag(&v)));
     *ENABLED
 }
+
+/// Mouse look captures the mouse by itself while the game window has the
+/// focus, as PC games do (`VICTORY_MOUSE_AUTO=0`: only F2 / `~` lock it).
+/// Esc, P or F2 let it go; a click in the window takes it again.
+#[cfg(windows)]
+fn mouse_auto() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_MOUSE_AUTO").map_or(true, |v| parse_env_flag(&v)));
+    *ON
+}
+
+/// Driving keys of the PC layout: W and S also press the throttle (RT) and
+/// the brake (LT), Space the handbrake (RB) in place of jump. The pad cannot
+/// tell a car from a pavement, so this is a mode: F (enter or leave a
+/// vehicle) turns it over, F5 turns it over by hand when it is out of step.
+static VEHICLE_KEYS: AtomicBool = AtomicBool::new(false);
 
 /// Mouse-look sensitivity multiplier for `VICTORY_KBM_PC=1`
 /// (`VICTORY_MOUSE_SENS`, default `1.0`).
@@ -288,10 +304,28 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    fallback_for(keys, pc_kbm())
+    let pc = pc_kbm();
+    if pc {
+        // F (enter / leave a vehicle) and F5 turn the driving keys over, on
+        // the press.
+        static HELD: AtomicU32 = AtomicU32::new(0);
+        let held = |vk: u8| keys.iter().any(|k| k.virtual_key == vk);
+        let now = u32::from(held(b'F')) | u32::from(held(0x74)) << 1;
+        let before = HELD.swap(now, Ordering::Relaxed);
+        if now & !before != 0 {
+            let driving = !VEHICLE_KEYS.fetch_xor(true, Ordering::Relaxed);
+            tracing::info!(driving, "keyboard: driving keys (F / F5)");
+        }
+    }
+    fallback_with(keys, pc, pc && VEHICLE_KEYS.load(Ordering::Relaxed))
 }
 
+#[cfg(test)]
 fn fallback_for(keys: &[KeyState], pc_style: bool) -> PadState {
+    fallback_with(keys, pc_style, false)
+}
+
+fn fallback_with(keys: &[KeyState], pc_style: bool, driving: bool) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -300,13 +334,21 @@ fn fallback_for(keys: &[KeyState], pc_style: bool) -> PadState {
         }
     };
     let table: &[(u8, u32)] = if pc_style { &PC_BUTTONS } else { &FALLBACK_BUTTONS };
+    let mut buttons = table
+        .iter()
+        .filter(|(vk, _)| on(*vk) != 0.0)
+        .fold(0, |all, (_, bit)| all | bit);
+    if driving && on(0x20) != 0.0 {
+        // Space: the handbrake (RB), not jump (X) while driving.
+        buttons = (buttons & !X) | RIGHT_SHOULDER;
+        if on(b'X') != 0.0 {
+            buttons |= X;
+        }
+    }
     PadState {
-        buttons: table
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: if pc_style { 0.0 } else { on(b'Z') },
-        right_trigger: if pc_style { 0.0 } else { on(b'C') },
+        buttons,
+        left_trigger: if driving { on(b'S') } else if pc_style { 0.0 } else { on(b'Z') },
+        right_trigger: if driving { on(b'W') } else if pc_style { 0.0 } else { on(b'C') },
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
@@ -1366,6 +1408,9 @@ mod host {
         mouse_locked: bool,
         just_locked: bool,
         toggle_was_down: bool,
+        /// The player let the mouse go (Esc, P, F2): no automatic capture
+        /// until a click in the window ([`super::mouse_auto`]).
+        released: bool,
         anchor: (i32, i32),
         mouse_last_poll: Option<Instant>,
         mouse_look: MouseLook,
@@ -1503,6 +1548,7 @@ mod host {
                 let next = !self.mouse_locked;
                 self.set_mouse_locked(next, Some(hwnd));
                 self.just_locked = next;
+                self.released = !next;
                 self.mouse_look.reset();
                 tracing::info!(locked = next, "mouse look toggled");
             }
@@ -1513,6 +1559,7 @@ mod host {
             if self.mouse_locked && (key_down(0x1B) || key_down(i32::from(b'P'))) {
                 self.set_mouse_locked(false, Some(hwnd));
                 self.just_locked = false;
+                self.released = true;
                 self.mouse_look.reset();
                 tracing::info!("mouse look unlocked (menu key)");
             }
@@ -1577,6 +1624,20 @@ mod host {
 
             let in_client =
                 (c_left..c_right).contains(&pos.x) && (c_top..c_bottom).contains(&pos.y);
+            // Automatic capture: at once while the window has the focus,
+            // after the player let the mouse go only on a click inside it
+            // (that click does not fire: the buttons start over from it).
+            if super::mouse_auto() && !self.mouse_locked {
+                let click = key_down(0x01) && in_client;
+                if !self.released || click {
+                    self.set_mouse_locked(true, Some(hwnd));
+                    self.just_locked = true;
+                    self.released = false;
+                    self.mouse_look.reset();
+                    self.mouse_buttons.reset();
+                    tracing::info!(on_click = click, "mouse look captured");
+                }
+            }
             let [lmb, rmb, mmb] = self.mouse_buttons.update(
                 [key_down(0x01), key_down(0x02), key_down(0x04)],
                 self.mouse_locked || in_client,
@@ -1968,14 +2029,15 @@ mod tests {
         assert_eq!(got[..4], keys[..]);
         release(r);
 
+        // The PC layout (the default): C is look behind (R3), the triggers
+        // are the mouse's.
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(
             pad(r),
             PadState {
-                buttons: A,
+                buttons: A | RIGHT_STICK,
                 left_y: 1.0,
                 right_x: 1.0,
-                right_trigger: 1.0,
                 ..Default::default()
             }
         );
@@ -2117,6 +2179,21 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn driving_keys_press_the_triggers_and_space_is_the_handbrake() {
+        let key = |vk: u8| KeyState { virtual_key: vk, ..Default::default() };
+        let keys = [key(b'W'), key(0x20)];
+        let on_foot = fallback_with(&keys, true, false);
+        assert_eq!((on_foot.left_y, on_foot.right_trigger), (1.0, 0.0));
+        assert_ne!(on_foot.buttons & X, 0, "Space jumps on foot");
+        let driving = fallback_with(&keys, true, true);
+        assert_eq!((driving.left_y, driving.right_trigger, driving.left_trigger), (1.0, 1.0, 0.0));
+        assert_eq!(driving.buttons & X, 0, "Space is not jump while driving");
+        assert_ne!(driving.buttons & RIGHT_SHOULDER, 0, "Space is the handbrake");
+        let brake = fallback_with(&[key(b'S')], true, true);
+        assert_eq!((brake.left_y, brake.left_trigger), (-1.0, 1.0));
     }
 
     #[test]
