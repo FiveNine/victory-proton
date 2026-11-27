@@ -9568,7 +9568,7 @@ impl Meter {
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                      GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                     {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                     {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects ({object_noted} noted by their memory, VICTORY_OBJECT_SLOTS); \
                      textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                      {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                     picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
@@ -9590,7 +9590,8 @@ impl Meter {
                     ),
                     making = crate::pipeline::making(),
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
-                    objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+                    objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed),
+                    object_noted = crate::descriptor::host::OBJECT_SLOTS_NOTED.load(Ordering::Relaxed)
                 );
                 #[cfg(feature = "diagnostics")]
                 {

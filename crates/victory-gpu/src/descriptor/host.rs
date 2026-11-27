@@ -291,6 +291,18 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
         .min()
 }
 
+/// Whether the slots of texture objects are made again with those of
+/// placed views of their memory ([`Spans::objects`];
+/// `VICTORY_OBJECT_SLOTS=0`: only the placed views', as before).
+fn object_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OBJECT_SLOTS").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: writes of slots with a view of a texture object noted
+/// by its memory ([`Spans::note_object`]).
+pub(crate) static OBJECT_SLOTS_NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Levels on demand (`crate::tiles`): where the placed textures start
 /// whose first level with memory changed since a texture pass last took
 /// them ([`HostHeap::texture_views_remade`]).
@@ -614,6 +626,14 @@ pub(crate) struct Spans {
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    /// Slots that hold a view of a texture object (not of memory), by
+    /// where its title memory starts. Not spans: they make no view stale.
+    /// The slots of a texture are made again from its host copy when that
+    /// copy changes (a new one with more levels, levels given memory or
+    /// written by the card): a view of the object is made from the copy
+    /// too, and kept showing the old one, which is let go 4 frames on.
+    objects: std::collections::HashMap<u64, std::collections::BTreeSet<u32>>,
+    object_of: std::collections::HashMap<u32, u64>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -751,11 +771,32 @@ impl Spans {
 
     /// The slots that hold a view of the texture at `start`.
     fn slots_at(&self, start: u64) -> Vec<u32> {
-        self.by_start.get(&start).map(|span| span.1.iter().copied().collect()).unwrap_or_default()
+        let placed = self.by_start.get(&start).into_iter().flat_map(|span| span.1.iter().copied());
+        let objects = if object_slots() { self.objects.get(&start) } else { None };
+        placed.chain(objects.into_iter().flatten().copied()).collect()
+    }
+
+    /// Slot `index` holds a view of the texture object whose title memory
+    /// starts at `start` ([`Spans::objects`]).
+    fn note_object(&mut self, index: u32, start: u64) {
+        if self.object_of.get(&index) == Some(&start) {
+            return;
+        }
+        self.forget(index);
+        self.objects.entry(start).or_default().insert(index);
+        self.object_of.insert(index, start);
     }
 
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
+        if let Some(start) = self.object_of.remove(&index)
+            && let Some(slots) = self.objects.get_mut(&start)
+        {
+            slots.remove(&index);
+            if slots.is_empty() {
+                self.objects.remove(&start);
+            }
+        }
         self.first.remove(&index);
         let Some(start) = self.by_slot.remove(&index) else {
             return;
@@ -2709,13 +2750,28 @@ impl HostHeap {
             }
             _ => None,
         };
+        // Where the title memory of a texture object the view shows starts
+        // ([`Spans::objects`]); as above, not for a slot tables read.
+        let object_view = match view {
+            Some(View::Shader(r, _))
+                if placed_view.is_none()
+                    && object_slots()
+                    && crate::resource::buffer_bytes(*r as crate::object::This).is_none()
+                    && !self.tabled_lately(index, crate::frame::current()) =>
+            {
+                crate::resource::texture_memory(*r as crate::object::This)
+                    .map(|(at, _)| at as u64)
+                    .filter(|&at| at != 0)
+            }
+            _ => None,
+        };
         // (Under the slot's lock, as every write of it: whether it is in
         // `spanned` changes only here.)
         let in_spans = |index: u32| {
             let bit = 1u64 << (index % 64);
             self.spanned.0.get(index as usize / 64).is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
         };
-        let stale = if placed_view.is_none() && !in_spans(index) && spans_quick() {
+        let stale = if placed_view.is_none() && object_view.is_none() && !in_spans(index) && spans_quick() {
             SPANS_QUICK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Vec::new()
         } else {
@@ -2738,8 +2794,14 @@ impl HostHeap {
                     stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()
                 }
                 None => {
-                    placed.forget(index);
-                    self.spanned.remove(index);
+                    if let Some(start) = object_view {
+                        placed.note_object(index, start);
+                        self.spanned.put(index);
+                        OBJECT_SLOTS_NOTED.fetch_add(1, Relaxed);
+                    } else {
+                        placed.forget(index);
+                        self.spanned.remove(index);
+                    }
                     Vec::new()
                 }
             }
@@ -2751,16 +2813,7 @@ impl HostHeap {
                 textures.remove(slot);
             }
         }
-        let stride = view.and_then(view_stride);
-        let kind = view.map_or(0, view_kind);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
-            write_view_address(*data, index, view);
-        }
+        let stride = self.write_stride(index, view);
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -2791,9 +2844,41 @@ impl HostHeap {
         }
     }
 
+    /// Enters `view`'s stride and format kind, and its title address, at
+    /// slot `index` of the tables shaders read them from
+    /// ([`victory_shader::emit::SLOT_STRIDES`]); returns the stride.
+    fn write_stride(&self, index: u32, view: Option<&View>) -> Option<u32> {
+        let stride = view.and_then(view_stride);
+        let kind = view.map_or(0, view_kind);
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            write_view_address(*data, index, view);
+        }
+        stride
+    }
+
+    /// Whether dynamic slots (draws' tables) are entered in the tables of
+    /// strides and kinds too (`VICTORY_DYNAMIC_STRIDES=1`; off: title slots
+    /// only, as before). A shader that asks the kind of a view in its table
+    /// ([`victory_shader::emit::SLOT_TABLE_STRIDES`]) reads it at the slot
+    /// the table is made in: without it, the facial solver's 16-bit integer
+    /// views read as float, and mouths do not move. With it they move, but
+    /// open too far and drag the face (run n1): something more is amiss.
+    fn dynamic_strides() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_STRIDES").is_some_and(|v| v == "1"))
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        if Self::dynamic_strides() {
+            self.write_stride(index, Some(view));
+        }
         let kept = make_twinned(view, self.at(index), self.twin(index));
         if kept.is_none() {
             null_for(view, self.at(index));
@@ -2841,6 +2926,9 @@ impl HostHeap {
                 views.made.insert(words, ListView { view, at, twin, kept, listed });
             }
             let made = &views.made[&words];
+            if Self::dynamic_strides() {
+                self.write_stride(index, Some(&made.view));
+            }
             self.copy_from(index, views.slot(made.at));
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
@@ -2872,6 +2960,9 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            if index >= self.count && Self::dynamic_strides() {
+                self.write_stride(index, None);
+            }
         }
         self.clear_twin(index);
         self.keep(index, None);

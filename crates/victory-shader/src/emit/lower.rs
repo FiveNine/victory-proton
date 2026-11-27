@@ -1543,6 +1543,13 @@ thread_local! {
 }
 
 /// The bits of [`super::rdna`] that count on this host.
+/// Whether pixel programs' colours are made numbers ([`Lower`]'s outputs;
+/// `VICTORY_NAN_GUARD=0`: written as they are, as before).
+fn nan_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0"))
+}
+
 pub(super) fn host_rdna() -> u32 {
     #[cfg(test)]
     if let Some(bits) = TEST_RDNA.get() {
@@ -13102,7 +13109,8 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let (kind, comp) = (el.kind, el.comp);
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -13112,6 +13120,30 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            // A colour a pixel program writes is a number: a NaN as 0, an
+            // infinity as the largest half (+-65504). The console's targets
+            // took them as their formats do; a NaN or infinity a glossy edge
+            // gives (on clear plastic, eyes) stayed in the title's history
+            // of past frames and its bloom spread it: sparkles.
+            let x = if !mesh && self.s.pixel && kind == 16 && comp == 9 && nan_guard() {
+                let c = self.cur;
+                let bits = self.as_int(x);
+                let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+                let abs = self.s.m.bin(c, Bin::And, bits, abs_mask);
+                let inf = self.s.m.i32(0x7F80_0000);
+                let is_nan = self.s.m.cmp(c, pred::IUGT, abs, inf);
+                let is_inf = self.s.m.cmp(c, pred::EQ, abs, inf);
+                let sign_mask = self.s.m.i32(0x8000_0000);
+                let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+                let most = self.s.m.i32(0x477F_E000);
+                let most = self.s.m.bin(c, Bin::Or, sign, most);
+                let zero = self.s.m.i32(0);
+                let fixed = self.s.m.select(c, is_inf, most, bits);
+                let fixed = self.s.m.select(c, is_nan, zero, fixed);
+                self.as_float(fixed)
+            } else {
+                x
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),
