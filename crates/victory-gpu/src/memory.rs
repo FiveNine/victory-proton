@@ -69,7 +69,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, RAY_PROBE_DWORDS};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -289,6 +289,9 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// `VICTORY_RAY_PROBE=1`: the probe's counters as last read (they only
+    /// grow; the GPU adds to them while they are read).
+    probe_seen: [u32; RAY_PROBE_DWORDS as usize],
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -331,6 +334,13 @@ struct Stats {
     lock_held: u64,
     /// Pages that keep faulting given a window's copy.
     from_windows: u64,
+    /// `VICTORY_BVH_HEADERS=1`: structure headers named for programs that
+    /// pick structures by a computed index, those of them whose page had no
+    /// copy then, and the pages that came for them.
+    headers: [u64; 3],
+    /// `VICTORY_RAY_PROBE=1`: the probe's counters summed since the last
+    /// report ([`victory_shader::emit::RAY_PROBE_DWORDS`]).
+    probe: [u64; RAY_PROBE_DWORDS as usize],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -355,10 +365,12 @@ impl Memory {
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+        // (After the page notes, the ray probe's counters: `VICTORY_RAY_PROBE=1`.)
+        let dwords = MEMORY_FAULTS + RAY_PROBE_DWORDS;
+        let (faults, data) = host.shared_buffer(u64::from(dwords) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
+        unsafe { std::ptr::write_bytes(data, 0, dwords as usize * 4) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -391,6 +403,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            probe_seen: [0; RAY_PROBE_DWORDS as usize],
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -797,6 +810,16 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        if victory_shader::emit::ray_probe() {
+            for (k, seen) in self.probe_seen.iter_mut().enumerate() {
+                // SAFETY: inside the faults' mapping (the counters after the
+                // notes); the GPU may be adding, a count missed now is read
+                // next frame.
+                let now = unsafe { self.faults.1.add(MEMORY_FAULTS as usize + k).read_volatile() };
+                self.stats.probe[k] += u64::from(now.wrapping_sub(*seen));
+                *seen = now;
+            }
+        }
         let mut pages = Vec::new();
         let mut stores = std::collections::HashSet::new();
         for i in 1..MEMORY_FAULTS as usize {
@@ -1100,6 +1123,38 @@ impl Memory {
             s.sweep_us as f64 / 1000.0 / frames,
             s.sweep_pages_us as f64 / 1000.0 / frames
         );
+        if crate::descriptor::host::bvh_headers() {
+            let [named, missing, came] = s.headers;
+            tracing::info!(
+                "title memory by address (VICTORY_BVH_HEADERS): per frame {:.1} structure headers named for programs that pick                  structures by index, {:.1} of them with no copy then ({missing} in all since the last line), {came} pages came for them",
+                named as f64 / frames,
+                missing as f64 / frames,
+            );
+        }
+        if victory_shader::emit::ray_probe() {
+            let p = s.probe;
+            let per = |n: u64| n as f64 / frames;
+            let share = |n: u64, of: u64| if of == 0 { 0.0 } else { 100.0 * n as f64 / of as f64 };
+            tracing::info!(
+                node_tests = p[0],
+                box_nodes = p[5],
+                triangle_tests = p[1],
+                finite_hits = p[2],
+                nan = p[3],
+                infinite = p[6],
+                no_copy = p[4],
+                "ray probe (VICTORY_RAY_PROBE): per frame {:.0} node tests ({:.0} boxes), {:.0} triangle tests, {:.0} finite hits ({:.1}% of                  triangle tests), {:.0} NaN distances, {:.0} infinite (misses), {:.0} node tests on pages with no copy ({:.1}%)",
+                per(p[0]),
+                per(p[5]),
+                per(p[1]),
+                per(p[2]),
+                share(p[2], p[1]),
+                per(p[3]),
+                per(p[6]),
+                per(p[4]),
+                share(p[4], p[0]),
+            );
+        }
         self.stats.from = Some((now, self.frame));
     }
 }
@@ -1220,6 +1275,7 @@ pub(crate) fn ready(
     addresses: &[u64],
     written: &[u64],
     constants: &[u32],
+    headers: &[u64],
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
@@ -1370,6 +1426,24 @@ pub(crate) fn ready(
                 came[2] += held(m).saturating_sub(before);
             }
         }
+    }
+    // `VICTORY_BVH_HEADERS=1`: the header page of every structure the heap
+    // holds a view of, for a program that picks them by a computed index
+    // (from DexNom/VIctory 8114ff77 `memory.rs`).
+    for &at in headers.iter().filter(|&&a| a >= 1 << 32) {
+        if !named(7, at) {
+            continue;
+        }
+        m.stats.headers[0] += 1;
+        if m.copy_of(at / PAGE).is_none() {
+            m.stats.headers[1] += 1;
+        }
+        let before = held(m);
+        match crate::shadow::in_buffer(at, 1) {
+            Some(_) => m.ready(at, 1),
+            None => m.ready(at, PAGE),
+        }
+        m.stats.headers[2] += held(m).saturating_sub(before);
     }
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;

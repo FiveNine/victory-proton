@@ -147,6 +147,15 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // The same of `VICTORY_BVH_SLOT_BOUNDS=1` (a picked structure past
+        // the address table is a zero record) and `VICTORY_RAY_PROBE=1`
+        // (node tests count what they find): only when on.
+        if victory_shader::emit::slot_bounds() {
+            bytes.extend_from_slice(b"VICTORY_BVH_SLOT_BOUNDS=1");
+        }
+        if victory_shader::emit::ray_probe() {
+            bytes.extend_from_slice(b"VICTORY_RAY_PROBE=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

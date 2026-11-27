@@ -198,6 +198,10 @@ pub(crate) struct HostHeap {
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
     buffers: Slots,
+    /// `VICTORY_BVH_HEADERS=1` ([`bvh_headers`]): the title slots holding a
+    /// ray-tracing structure's view, with the structure's title address,
+    /// and those addresses once sorted ([`HostHeap::structure_addresses`]).
+    structures: Mutex<(std::collections::BTreeMap<u32, u64>, Option<std::sync::Arc<[u64]>>)>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Slots,
@@ -1861,6 +1865,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Slots::new(count as usize),
+            structures: Mutex::default(),
             changed: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
             queued,
@@ -2942,6 +2947,21 @@ impl HostHeap {
         self.changed.take()
     }
 
+    /// The title addresses of the ray-tracing structures the heap holds
+    /// views of, sorted, each once (`VICTORY_BVH_HEADERS=1`; empty without).
+    pub(crate) fn structure_addresses(&self) -> std::sync::Arc<[u64]> {
+        let mut s = self.structures.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(all) = &s.1 {
+            return all.clone();
+        }
+        let mut all: Vec<u64> = s.0.values().copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        let all: std::sync::Arc<[u64]> = all.into();
+        s.1 = Some(all.clone());
+        all
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
@@ -3056,6 +3076,17 @@ impl HostHeap {
         self.write_stride(index, stride.unwrap_or(0) | kind);
         if let Some((_, _, data)) = &self.strides {
             write_view_address(*data, index, view);
+        }
+        if bvh_headers() {
+            let structure = view.and_then(structure_address);
+            let mut s = self.structures.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = match structure {
+                Some(at) => s.0.insert(index, at) != Some(at),
+                None => s.0.remove(&index).is_some(),
+            };
+            if changed {
+                s.1 = None;
+            }
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -3975,6 +4006,31 @@ pub(crate) fn view_address(view: &View) -> Option<u64> {
         }
         _ => buffer_range(view).map(|range| range.0),
     }
+}
+
+/// The title address of a ray-tracing structure's view (no resource: the
+/// view's description holds it); none for any other view.
+fn structure_address(view: &View) -> Option<u64> {
+    const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+    match view {
+        View::Shader(_, Some(desc)) if desc[1] == STRUCTURE => {
+            Some(u64::from(desc[4]) | u64::from(desc[5]) << 32).filter(|&at| at != 0)
+        }
+        _ => None,
+    }
+}
+
+/// `VICTORY_BVH_HEADERS=1` (off by default; from DexNom/VIctory 8114ff77
+/// `memory.rs`): a program that walks structures it picks from the heap at
+/// an index it computes (their addresses from the host's table,
+/// `victory_shader::emit::VIEW_ADDRESSES`) has the header page of every
+/// structure the heap holds a view of made ready before it runs
+/// ([`crate::memory::ready`]), as a structure named at a fixed place has;
+/// without it such a header comes only from the shaders' fault notes, a
+/// frame late and not once their bound (`VICTORY_BVH_FAULTS_ALL`) is met.
+pub(crate) fn bvh_headers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_HEADERS").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Enters the title address of `view` (0 for none, or a view that is no

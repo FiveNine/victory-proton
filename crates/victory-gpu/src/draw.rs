@@ -1571,7 +1571,21 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
+        // `VICTORY_BVH_HEADERS=1`: a program that walks structures and
+        // picks views by an index it computes (their addresses from the
+        // host's table after the strides) has every structure's header the
+        // heap holds a view of made ready (from DexNom/VIctory 8114ff77).
+        let picks = |slot| t.host.root_srvs.contains(&slot);
+        let headers = if crate::descriptor::host::bvh_headers()
+            && use_ == crate::memory::Use::Reads
+            && picks(victory_shader::emit::SLOT_STRIDES)
+            && picks(victory_shader::emit::SLOT_MEMORY)
+        {
+            heap.structure_addresses()
+        } else {
+            std::sync::Arc::from([])
+        };
+        crate::memory::ready(list, heap, &addresses, &written, &constants, &headers, use_, t.threads)
     }
 
     /// The bound heap holding `handle`.

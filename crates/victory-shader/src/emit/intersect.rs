@@ -235,12 +235,25 @@ impl<'a> Lower<'a> {
         } else {
             false
         };
-        let head = self.cur;
+        let top = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
-        let kind = self.s.m.bin(head, Bin::And, pointer, k7);
-        let pair = self.s.m.bin(head, Bin::And, pointer, k6);
-        let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
-        let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        let kind = self.s.m.bin(top, Bin::And, pointer, k7);
+        let pair = self.s.m.bin(top, Bin::And, pointer, k6);
+        let is_box = self.s.m.cmp(top, pred::EQ, pair, k4);
+        let is_triangle = self.s.m.cmp(top, pred::IULT, kind, k4);
+        // `VICTORY_RAY_PROBE=1`: what the lanes test (title memory alone:
+        // the faults buffer the counters lie in is bound with it).
+        let probe = crate::emit::ray_probe() && matches!(at, NodeAt::Memory { .. });
+        if probe {
+            let yes = self.s.m.bool(true);
+            self.ray_probe_count(0, yes);
+            if let NodeAt::Memory { mapped, .. } = at {
+                let none = self.s.m.bin(self.cur, Bin::Xor, mapped, yes);
+                self.ray_probe_count(4, none);
+            }
+            self.ray_probe_count(5, is_box);
+        }
+        let head = self.cur;
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -255,6 +268,9 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
         let triangle = self.bvh_triangle(at, kind, &ray);
+        if probe {
+            self.ray_probe_triangle(&ray, triangle);
+        }
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
@@ -287,6 +303,62 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())
+    }
+
+    /// `VICTORY_RAY_PROBE=1` (after DexNom/VIctory 8114ff77
+    /// `memory/ray_probe.rs`): adds the lanes where `yes` holds to counter
+    /// `word` after the page notes of the faults buffer
+    /// ([`crate::emit::RAY_PROBE_DWORDS`]), one atomic add per wave (by its first
+    /// lane, and none for a wave that counts 0).
+    fn ray_probe_count(&mut self, word: u32, yes: V) {
+        use crate::emit::{MEMORY_FAULTS, SLOT_FAULTS};
+        let (i32t, i1) = (self.s.t.i32, self.s.t.i1);
+        let count = self.s.op(self.cur, "waveAllOp", Attr::NoUnwind, i32t, 135, &[yes]);
+        let first = self.s.op(self.cur, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        self.s.flags |= flags::WAVE_OPS;
+        let zero = self.s.m.i32(0);
+        let some = self.s.m.cmp(self.cur, pred::NE, count, zero);
+        let adds = self.s.m.bin(self.cur, Bin::And, first, some);
+        let lane = self.begin_guarded(Some(adds));
+        let storage = self.s.root_uav_handle(SLOT_FAULTS);
+        let byte = self.s.m.i32(4 * (MEMORY_FAULTS + word));
+        let undef = self.s.m.undef(i32t);
+        self.s.op(
+            self.cur,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[storage, zero, byte, undef, undef, count],
+        );
+        self.end_guarded(lane, &[]);
+    }
+
+    /// The probe's counts of a triangle test's result (`result`: distance
+    /// numerator and denominator, then the barycentric numerators): every
+    /// test (1), a finite hit in front within the ray's extent (2), a NaN
+    /// distance (3), an infinite one (6; a miss is one).
+    fn ray_probe_triangle(&mut self, ray: &Ray, result: [V; 4]) {
+        let c = self.cur;
+        let numerator = self.as_float(result[0]);
+        let denominator = self.as_float(result[1]);
+        let distance = self.s.m.bin(c, Bin::SDiv, numerator, denominator);
+        let zero = self.s.m.f32(0);
+        let (up, down) = (self.s.m.f32(f32::INFINITY.to_bits()), self.s.m.f32(f32::NEG_INFINITY.to_bits()));
+        let forward = self.s.m.cmp(c, pred::OGE, distance, zero);
+        let finite = self.s.m.cmp(c, pred::OLT, distance, up);
+        let within = self.s.m.cmp(c, pred::OLE, distance, ray.extent);
+        let hit = self.s.m.bin(c, Bin::And, forward, finite);
+        let hit = self.s.m.bin(c, Bin::And, hit, within);
+        let nan = self.s.m.cmp(c, pred::UNO, distance, distance);
+        let plus = self.s.m.cmp(c, pred::OEQ, distance, up);
+        let minus = self.s.m.cmp(c, pred::OEQ, distance, down);
+        let infinite = self.s.m.bin(c, Bin::Or, plus, minus);
+        let yes = self.s.m.bool(true);
+        self.ray_probe_count(1, yes);
+        self.ray_probe_count(2, hit);
+        self.ray_probe_count(3, nan);
+        self.ray_probe_count(6, infinite);
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the

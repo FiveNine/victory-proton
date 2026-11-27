@@ -101,6 +101,9 @@ after it was given them as an unordered access view.
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
+| `VICTORY_BVH_SLOT_BOUNDS=1` | (off; from DexNom/VIctory 8114ff77 `guest_address.rs`) a structure picked at a computed heap index past the host's address table reads address 0 (a zero record, the walk finds nothing) instead of the last slot's structure; changes translations (part of the shader cache key when on) |
+| `VICTORY_BVH_HEADERS=1` | (off; from DexNom/VIctory 8114ff77 `memory.rs`) a walking program that picks structures by a computed index has the header page of every structure the heap holds a view of made ready before it runs, instead of waiting for fault notes (which stop at `VICTORY_BVH_FAULTS_ALL`); logs "title memory by address (VICTORY_BVH_HEADERS): ..." every ten seconds with how many headers had no copy |
+| `VICTORY_RAY_PROBE=1` | (off; diagnostics, after DexNom/VIctory 8114ff77 `memory/ray_probe.rs`) every node test over title memory counts, one atomic add per wave, node tests, boxes, triangle tests, finite hits, NaN and infinite distances and nodes read from pages with no copy; logs "ray probe (VICTORY_RAY_PROBE): ..." every ten seconds; changes translations (cache key when on) |
 
 Every ten seconds the log has a line "title memory by address: ..." with pages,
 dispatches, faults and what came.

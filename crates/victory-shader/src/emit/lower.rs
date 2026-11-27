@@ -3557,11 +3557,11 @@ impl<'a> Lower<'a> {
             return Ok(None);
         }
         let c = self.cur;
-        let slot = self.heap_index(site, 0, false)?;
+        let picked = self.heap_index(site, 0, false)?;
         // Inside the table whatever the index: a root view has no bounds.
         let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
         let i32t = self.s.t.i32;
-        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[picked, last]);
         self.s.m.tag(slot, Tag::Clamp);
         let three = self.s.m.i32(3);
         let byte = self.s.m.bin(c, Bin::Shl, slot, three);
@@ -3569,6 +3569,20 @@ impl<'a> Lower<'a> {
         let byte = self.s.m.bin(c, Bin::Add, byte, base);
         let h = self.s.root_srv_handle(SLOT_STRIDES);
         let words = self.raw_dwords(h, byte, 2);
+        // `VICTORY_BVH_SLOT_BOUNDS=1` (from DexNom/VIctory 8114ff77
+        // `guest_address.rs`): an index past the table is a zero record
+        // (address 0: the walk reads zeros and finds nothing), not the last
+        // slot's view, which may be an unrelated structure. The read above
+        // stays clamped, so it is inside the table either way.
+        if super::slot_bounds() {
+            let c = self.cur;
+            let count = self.s.m.i32(SLOT_STRIDES_COUNT);
+            let inside = self.s.m.cmp(c, pred::IULT, picked, count);
+            let zero = self.s.m.i32(0);
+            let lo = self.s.m.select(c, inside, words[0], zero);
+            let hi = self.s.m.select(c, inside, words[1], zero);
+            return Ok(Some((lo, hi)));
+        }
         Ok(Some((words[0], words[1])))
     }
 

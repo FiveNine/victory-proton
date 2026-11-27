@@ -201,6 +201,53 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`slot_bounds`].
+    pub(crate) static SLOT_BOUNDS_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// For a test's thread alone: [`ray_probe`].
+    pub(crate) static RAY_PROBE_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_BVH_SLOT_BOUNDS=1` (off by default; from DexNom/VIctory 8114ff77
+/// `guest_address.rs`): a view (the ray tracer's structure) picked from the
+/// heap or a table at an index the program computes, whose address comes
+/// from the host's table by view heap slot ([`VIEW_ADDRESSES`]), reads
+/// address 0 (a zero record: the walk finds nothing) when the index is past
+/// the table, instead of the last slot's address (clamped, which can be
+/// another structure's). Part of the translation: the shader cache keys on it.
+pub fn slot_bounds() -> bool {
+    #[cfg(test)]
+    if let Some(on) = SLOT_BOUNDS_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_SLOT_BOUNDS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Dwords of ray-probe counters after the [`MEMORY_FAULTS`] page notes in
+/// the host's faults buffer ([`ray_probe`]): 0 node tests, 1 triangle
+/// tests, 2 finite triangle hits (in front, within the ray's extent),
+/// 3 triangle tests whose distance is NaN or infinite, 4 node tests whose
+/// node page had no copy (read as zeros), 5 box nodes, 6-7 spare.
+pub const RAY_PROBE_DWORDS: u32 = 8;
+
+/// `VICTORY_RAY_PROBE=1` (off by default; after DexNom/VIctory 8114ff77
+/// `memory/ray_probe.rs`): every translated node test
+/// (`image_bvh*_intersect_ray`) counts, one atomic add per wave, what it
+/// tested and found into [`RAY_PROBE_DWORDS`] counters after the page notes
+/// of the faults buffer; the host logs them (`victory_gpu::memory`), so a
+/// run shows whether rays find the scene. Part of the translation: the
+/// shader cache keys on it.
+pub fn ray_probe() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RAY_PROBE_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RAY_PROBE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
