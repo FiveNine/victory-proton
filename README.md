@@ -68,6 +68,16 @@ What changed:
     22.3 fps, no device loss.
   - Fault diagnostics: what found a page (load or store, ray program or
     builder), `VICTORY_FAULT_LIST`, `VICTORY_WINDOW_LIST`.
+- Merged avatarmanz's main again (the interrogation room now lit as by
+  day) and kroeeee-eeee's Linux fork (renderer port 1 under Wine, loops
+  dxil-spirv can take, far fewer `VirtualQuery`, `VICTORY_COPY_COMPARE`, a
+  huge-page helper in `linux/thp/`). Measured here with ray tracing, 240 s:
+  port 1 without huge pages 18.4 fps against 22.6, the other ports and
+  `VICTORY_COPY_COMPARE=1` no change; all off by default. `VICTORY_PROFILE`
+  (CPU stacks) works under Wine (upstream PR #343); `VICTORY_KBM_GTA=1`
+  maps keyboard and mouse as GTA V on PC (PR #295).
+- An old `d3dcompiler_47.dll` (6.3.9600, Windows 8.1) gives a black world:
+  the run script refuses it, the log says so loudly (`3de0fac`, issue #1).
 - Output 1080p rendered at 1080p by default in the run script
   (`VICTORY_OUTPUT`, `VICTORY_RENDER_SCALE`): 22.5 fps against 20.0 at 4K,
   heavy scenes 22.2 against 14.6.
