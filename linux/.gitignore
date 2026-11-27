@@ -1,0 +1,10 @@
+bin/
+game/
+victory-data/
+proton-patched/
+proton-prefix-exp/
+keep/**/*.dll
+*.log
+*-hw.tsv
+captures*/
+__pycache__/
