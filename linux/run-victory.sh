@@ -154,6 +154,22 @@ export WINEPREFIX="$STEAM_COMPAT_DATA_PATH/pfx"
 # (indirect clamp, depth twins, ambient light, rectangle lists).
 DLL="$HERE/victory-data/dlls/d3dcompiler_47.dll"
 [ -f "$DLL" ] && cp -u "$DLL" "$(dirname "$EXE")/"
+# It must be a Windows 10 SDK one (10.0.x). The Windows 8.1 one (6.3.9600)
+# that older games ship does not know cs_5_1: the indirect argument clamp
+# is never made, every indirect draw is dropped and the world is black
+# with working menus (issue #1, K53N0). VICTORY_ANY_D3DCOMPILER=1 skips this.
+if [ -f "$DLL" ] && [ "${VICTORY_ANY_D3DCOMPILER:-0}" != 1 ] && command -v python3 >/dev/null; then
+  DLLVER=$(python3 -c 'import struct,sys
+b=open(sys.argv[1],"rb").read(); j=b.find(b"\xbd\x04\xef\xfe")
+ms,ls=struct.unpack("<II",b[j+8:j+16]) if j>=0 else (0,0)
+print(f"{ms>>16}.{ms&0xffff}.{ls>>16}.{ls&0xffff}")' "$DLL" 2>/dev/null)
+  if [ "${DLLVER%%.*}" -lt 10 ] 2>/dev/null; then
+    echo "run-victory.sh: $DLL is version $DLLVER; VIctory needs a Windows 10 SDK d3dcompiler_47.dll (10.0.x)." >&2
+    echo "  This one cannot compile cs_5_1: indirect draws are dropped and the world renders black." >&2
+    echo "  Replace it (or set VICTORY_ANY_D3DCOMPILER=1 to start anyway)." >&2
+    exit 1
+  fi
+fi
 # vkd3d-proton from Proton Experimental (build 5679) next to victory.exe:
 # GE-Proton10-34's (5122) translates some of the title's shaders to invalid
 # SPIR-V that crashes RADV, and a crash mid-compile leaves the driver's locks

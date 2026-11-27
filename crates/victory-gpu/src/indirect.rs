@@ -247,7 +247,19 @@ fn clamp() -> Option<&'static Clamp> {
         .get_or_init(|| match make() {
             Ok(c) => Some(c),
             Err(e) => {
-                tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
+                // Loud: the symptom (a black world with working menus) looks
+                // like a dozen other problems. The usual cause is an old
+                // d3dcompiler_47.dll (6.3.9600, Windows 8.1) that does not
+                // know cs_5_1 (issue #1 of FiveNine/victory-proton, K53N0).
+                tracing::error!(
+                    error = %e,
+                    "no argument clamp: EVERY indirect draw and dispatch will be dropped and the world will render black; \
+                     d3dcompiler_47.dll must be a Windows 10 SDK one (10.0.x), the Windows 8.1 one (6.3.9600) has no cs_5_1"
+                );
+                eprintln!(
+                    "VIctory: the indirect argument clamp could not be compiled ({e}): every indirect draw is dropped \
+                     and the world will render black. Use a Windows 10 SDK d3dcompiler_47.dll (10.0.x)."
+                );
                 None
             }
         })
@@ -393,15 +405,31 @@ fn validate_layout(
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
 /// available.
+/// Which step left an indirect execution unbounded (the layout, the clamp,
+/// the budget, the scratch buffer or the recording), said 60 times in all:
+/// the drop reason alone covers all five (K53N0's patch, issue #1).
+fn why_not(step: &'static str) -> Option<ID3D12Resource> {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
+        tracing::warn!(step, "indirect execution not bounded");
+    }
+    None
+}
+
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    let Some(bytes) = validate_layout(spec, src.1, count.map(|(_, off)| off)) else { return why_not("layout") };
+    let Some(c) = clamp() else { return why_not("clamp") };
+    let Some(budget) = list.budget() else { return why_not("budget") };
+    let Some(dst) = list.indirect_scratch(bytes) else { return why_not("scratch") };
+    if !clamp_into(list, c, &dst, budget, src, count, spec, false) {
+        return why_not("record");
+    }
+    Some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -419,9 +447,14 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    let Some(bytes) = validate_layout(spec, src.1, None) else { return why_not("layout") };
+    let Some(c) = clamp() else { return why_not("clamp") };
+    let Some(budget) = list.budget() else { return why_not("budget") };
+    let Some(dst) = list.indirect_scratch(bytes) else { return why_not("scratch") };
+    if !clamp_into(list, c, &dst, budget, src, None, spec, true) {
+        return why_not("record");
+    }
+    Some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -472,6 +505,10 @@ fn record_clamp_as(
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+            tracing::warn!(src_base, dst_gpu, budget, src_offset, stride, records, kind, "clamp addresses not 4-byte aligned");
+        }
         return false;
     }
     let (src_gpu, args_offset) = match src_offset

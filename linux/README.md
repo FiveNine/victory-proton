@@ -15,7 +15,14 @@ profile. This repository.
   title's shaders; Proton Experimental's grew the process to 30 GB in
   seconds. The script copies them from `victory-data/dlls/vkd3d-master`.
 - **Microsoft's `d3dcompiler_47.dll`** in `victory-data/dlls/`: Wine's
-  cannot build VIctory's helper shaders.
+  cannot build VIctory's helper shaders. It must be a **Windows 10 SDK
+  one, version 10.0.x** (tested: 10.0.18362.1 here; 10.0.17134.12 and
+  10.0.28000.2705 reported working). Many older games ship the Windows 8.1
+  one, **6.3.9600**: it does not know `cs_5_1`, so the indirect argument
+  clamp is never made, every indirect draw is dropped and the world is
+  black while the menus work (log: `error X3506: unrecognized compiler
+  target 'cs_5_1'`, issue #1). The run script checks the version and stops
+  on an older one.
 - Your own dump of the title.
 
 [`run-victory.sh`](run-victory.sh) sets everything else: the prefix, the DLL
