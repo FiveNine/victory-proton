@@ -186,45 +186,59 @@ fn mouse_invert_y() -> bool {
     *INVERT
 }
 
-/// Exponentially smoothed mouse-delta to right-stick velocity converter.
+/// Mouse motion to right-stick deflection.
 ///
-/// The poll loop runs at 125 Hz (8 ms) while 3D gameplay may render at low
-/// framerates (~5 FPS). A 45 ms half-life keeps flicks alive long enough for
-/// the next rendered frame to sample them while settling cleanly to zero.
+/// The game ignores small stick deflections (its own dead zone), so a slow
+/// mouse turned the camera not at all and a fast one in jumps. Here 32 pixels
+/// of motion are a full deflection (times `VICTORY_MOUSE_SENS`), and any
+/// motion comes out at 0.22 or more of it: from just past that dead zone on.
+/// The deflection decays with a 30 ms time constant, so a flick stays visible
+/// to the game's slower reads, and is released 85 ms after the mouse stops.
 #[cfg(any(windows, test))]
 #[derive(Default)]
 struct MouseLook {
-    vx: f32,
-    vy: f32,
+    axes: (f32, f32),
+    /// Time since the mouse last moved (`None`: at rest).
+    since_motion: Option<Duration>,
 }
 
 #[cfg(any(windows, test))]
 impl MouseLook {
-    const BASE_SENS: f32 = 0.022;
-    const HALF_LIFE_SECS: f32 = 0.045;
-    const DEADZONE: f32 = 0.015;
+    const PIXELS_PER_STEP: f32 = 32.0;
+    const DECAY_SECS: f32 = 0.030;
+    const RELEASE: Duration = Duration::from_millis(85);
+    const DEAD_ZONE: f32 = 0.22;
 
     fn reset(&mut self) {
-        self.vx = 0.0;
-        self.vy = 0.0;
+        *self = Self::default();
     }
 
     fn step(&mut self, dx: i32, dy: i32, dt: Duration, sens: f32, invert_y: bool) -> (f32, f32) {
-        let dt_secs = dt.as_secs_f32().clamp(0.001, 0.25);
-        let decay = 0.5_f32.powf(dt_secs / Self::HALF_LIFE_SECS);
-        let scale = Self::BASE_SENS * sens;
+        if dt >= Self::RELEASE {
+            self.reset();
+        }
+        let moved = dx != 0 || dy != 0;
+        self.since_motion = if moved { Some(Duration::ZERO) } else { self.since_motion.map(|s| s + dt) };
+        if self.since_motion.is_none_or(|s| s >= Self::RELEASE) {
+            self.reset();
+            return (0.0, 0.0);
+        }
+        let decay = (-dt.as_secs_f32() / Self::DECAY_SECS).exp();
+        let scale = sens / Self::PIXELS_PER_STEP;
         let y_sign = if invert_y { 1.0 } else { -1.0 };
-        self.vx = (self.vx * decay + dx as f32 * scale).clamp(-1.0, 1.0);
-        self.vy = (self.vy * decay + dy as f32 * scale * y_sign).clamp(-1.0, 1.0);
-        // Only snap tiny residual decay to zero at rest so low-sensitivity
-        // 1-pixel movements are never dropped.
-        if dx == 0 && self.vx.abs() < Self::DEADZONE {
-            self.vx = 0.0;
+        let x = self.axes.0 * decay + dx as f32 * scale;
+        let y = self.axes.1 * decay + dy as f32 * scale * y_sign;
+        let magnitude = x.hypot(y);
+        // The decaying tail ends near zero; a fresh motion, however small, shows.
+        if magnitude == 0.0 || (!moved && magnitude < 0.01) {
+            self.axes = (0.0, 0.0);
+            return self.axes;
         }
-        if dy == 0 && self.vy.abs() < Self::DEADZONE {
-            self.vy = 0.0;
-        }
-        (self.vx, self.vy)
+        let strength = magnitude.min(1.0);
+        let direction = (x / magnitude, y / magnitude);
+        self.axes = (direction.0 * strength, direction.1 * strength);
+        let output = Self::DEAD_ZONE + strength * (1.0 - Self::DEAD_ZONE);
+        (direction.0 * output, direction.1 * output)
     }
 }
 
@@ -2190,6 +2204,25 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn mouse_look_clears_the_dead_zone_and_releases_when_the_mouse_stops() {
+        let mut look = MouseLook::default();
+        // One pixel already deflects past the game's dead zone.
+        let (x, y) = look.step(1, 0, POLL, 1.0, false);
+        assert!(x >= MouseLook::DEAD_ZONE && y == 0.0, "got {x}");
+        // 32 pixels in one poll: a full deflection.
+        look.reset();
+        assert!((look.step(32, 0, POLL, 1.0, false).0 - 1.0).abs() < 1e-6);
+        // Still deflected shortly after the mouse stops, released after 85 ms.
+        let (held, _) = look.step(0, 0, Duration::from_millis(40), 1.0, false);
+        assert!(held > MouseLook::DEAD_ZONE, "got {held}");
+        assert_eq!(look.step(0, 0, Duration::from_millis(50), 1.0, false), (0.0, 0.0));
+        // Higher sensitivity deflects further for the same motion.
+        let low = MouseLook::default().step(5, 0, POLL, 0.65, false).0;
+        let high = MouseLook::default().step(5, 0, POLL, 1.5, false).0;
+        assert!(low < high);
     }
 
     #[test]
