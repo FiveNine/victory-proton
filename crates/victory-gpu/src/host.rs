@@ -10352,6 +10352,13 @@ impl Host {
         );
     }
 
+    /// Ticks per second of the drawing queue's timestamps.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timestamp_frequency(&self) -> Option<u64> {
+        // SAFETY: a plain query of a live queue.
+        unsafe { self.queue.GetTimestampFrequency() }.ok()
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in

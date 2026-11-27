@@ -3252,8 +3252,14 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let profiled = if crate::gpuprof::on() { crate::gpuprof::before(&list.list, &format!("dispatch {}", p.name)) } else { None };
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(slot) = profiled {
+            crate::gpuprof::after(&list.list, slot);
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.after_dispatch(list, p);
@@ -3765,8 +3771,14 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let profiled = self.profile(list, "mesh");
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(slot) = profiled {
+                        crate::gpuprof::after(&list.list, slot);
+                    }
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4337,11 +4349,17 @@ impl State {
             if count == 3 && instances == 1 {
                 self.record_framegen_camera(list);
             }
+            #[cfg(feature = "diagnostics")]
+            let profiled = self.profile(list, "draw");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(slot) = profiled {
+                crate::gpuprof::after(&list.list, slot);
+            }
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4350,6 +4368,16 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// [`crate::gpuprof::before`] for what the bound pipeline records now.
+    #[cfg(feature = "diagnostics")]
+    fn profile(&self, list: &HostList, what: &str) -> Option<u32> {
+        if !crate::gpuprof::on() {
+            return None;
+        }
+        let name = crate::pipeline::host_pipeline(self.pipeline as This).map_or("?", |p| p.name.as_str());
+        crate::gpuprof::before(&list.list, &format!("{what} {name}"))
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -4442,11 +4470,17 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let profiled = self.profile(list, "indexed");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(slot) = profiled {
+                crate::gpuprof::after(&list.list, slot);
+            }
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4770,6 +4804,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let profiled = self.profile(list, &format!("indirect{kind}"));
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -4782,6 +4818,10 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(slot) = profiled {
+            crate::gpuprof::after(&list.list, slot);
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

@@ -28,7 +28,7 @@ const CELL: (u32, u32) = (6, 10);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 36;
 /// The rows below the head: nine pairs, a rule, three lines of the PC's own.
-const PAIRS: u32 = 9;
+const PAIRS: u32 = 10;
 const NOTES: u32 = 3;
 /// Dots of the head (the rate at twice the size) and of the rule.
 const HEAD: u32 = 2 * CELL.1 + 2;
@@ -424,6 +424,9 @@ fn text(c: &[f64; COUNTERS], ms: f64, rates: (f64, f64, f64), busy: f64, host: &
         pair("30 S HIGH", format!("{:.1} FPS", rates.0)),
         pair("30 S LOW", format!("{:.1} FPS", rates.1)),
         pair("30 S AVG", format!("{:.1} FPS", rates.2)),
+        // The frames the game itself draws (the number above counts frame
+        // generation's too): what the two times below add up to.
+        pair("RENDERED", format!("{:.1} FPS  {:.1} MS", 1e3 / ms.max(0.001), ms)),
         pair("DRAWS", format!("{:.0} / FRAME", c[10])),
         pair("FRAME CPU / GPU", format!("{:.1} / {:.1} MS", c[0] / 1e3, ms - idle)),
         pair("CPU", format!("{busy:.0}%")),
