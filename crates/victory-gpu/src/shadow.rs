@@ -5255,9 +5255,10 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
-    if !fine() {
+    // With whole windows (the default) there is one window to a cell, and
+    // with [`share`] off nothing to choose: exactly `find`. (With it, a
+    // window over a 4 MiB line holds asks of both cells.)
+    if !fine() && !share() {
         return find(address, len);
     }
     lookup(address, len, true)
@@ -5618,6 +5619,19 @@ pub(crate) fn window_over(start: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(_, sh)| sh.clone())
 }
 
+/// Whether asks that may take any window take one that holds them on the
+/// default grid too ([`loose`]; `VICTORY_WINDOW_SHARE=0`: not, as before).
+fn share() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_SHARE").is_none_or(|v| v != "0"))
+}
+
+/// How far below an ask's cell a window that holds it may begin.
+const SHARE_BELOW: u64 = 32 << 20;
+
+/// Since the start: asks [`share`] gave a window that held them already.
+pub(crate) static SHARED: AtomicU64 = AtomicU64::new(0);
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
@@ -5641,6 +5655,30 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    // On the default grid, an ask that may take any window ([`find_any`])
+    // takes one that holds it already, begun in its cell or in one below
+    // ([`share`]): an ask over a 4 MiB line makes an 8 MiB window, and the
+    // asks inside either half made 4 MiB windows of their own besides,
+    // copied again (run g1: 8,036 MB of windows over 4,792 MB of memory).
+    if any && !unsized_ask && !fine() && share() {
+        let from = cell.saturating_sub(SHARE_BELOW);
+        let found = {
+            let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+            let there = map.range((from, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            // The smallest: a draw brings the whole window it binds up to
+            // date, and the largest made each frame's copies 15-60 % more
+            // (run ws2).
+            there
+                .filter(|&(start, bytes)| start <= address && start + bytes >= end)
+                .min_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
+                .and_then(|key| map.get(&key).cloned())
+        };
+        if let Some(shadow) = found {
+            note(&shadow);
+            SHARED.fetch_add(1, Ordering::Relaxed);
+            return Some(shadow);
+        }
+    }
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());

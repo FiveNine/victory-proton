@@ -1013,10 +1013,11 @@ fn log_memory() {
     tracing::info!(
         "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
          memory that is in more than one window, and is copied once for each); host lists never \
-         reset since they were made: {}",
+         reset since they were made: {}; asks given a window that held them already (VICTORY_WINDOW_SHARE): {}",
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+        crate::shadow::SHARED.load(std::sync::atomic::Ordering::Relaxed),
     );
     if memory_categories() {
         let fields: &[(&str, u64)] = &[
