@@ -1417,6 +1417,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
+        // `VICTORY_BCPACK_ZERO=<n>`: BC<n> streams come out as zeros (to see
+        // what a picture owes to them).
+        Some(_) if std::env::var("VICTORY_BCPACK_ZERO").ok().and_then(|v| v.trim().parse::<u8>().ok()) == Some(bc) => {
+            out.fill(0);
+            Ok(out.len())
+        }
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),

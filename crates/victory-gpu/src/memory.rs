@@ -154,6 +154,15 @@ fn persist() -> (u32, usize) {
     })
 }
 
+/// Whether pages that keep faulting and lie in a window outside buffers get
+/// the window's copy (`VICTORY_FAULT_WINDOWS=1`; off: a window numbered so
+/// is held for the run, and in run fw2 they piled up until the PC's memory
+/// ran out at 140 s, with no better light).
+fn fault_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_WINDOWS").is_some_and(|v| v == "1"))
+}
+
 /// Frames a page given back waits before its place holds another: lists
 /// recorded with the old entry may still be on their way.
 const COOL: u64 = 6;
@@ -294,6 +303,8 @@ struct Stats {
     in_window: u64,
     /// Copies of structures over 4 MiB readied whole.
     copies_sized: u64,
+    /// Pages that keep faulting given a window's copy.
+    from_windows: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -812,8 +823,31 @@ impl Memory {
                 }
                 e.0
             };
-            let kept = frames > 0 && seen >= frames && self.persisted < most;
-            if made >= frame_cap || (budget == 0 && self.faulted >= all_cap && !stored && !kept) || self.copy_of(page).is_some() {
+            let persistent = frames > 0 && seen >= frames;
+            let kept = persistent && self.persisted < most;
+            if made >= frame_cap || self.copy_of(page).is_some() {
+                continue;
+            }
+            // A load of a page a window outside buffers holds already: the
+            // window's copy, read-only, costs nothing more (an arena's page
+            // is memory three times over: ours, its staging, the card's).
+            // Only for pages that keep faulting: the copy is then held for
+            // the run.
+            if !stored
+                && persistent
+                && fault_windows()
+                && self.possible(page)
+                && let Some(window) = crate::shadow::window_over(page * PAGE, PAGE)
+            {
+                let offset = page * PAGE - window.span().0;
+                if let Some(n) = self.number(window) {
+                    close(self.entry(page), n, offset);
+                    made += 1;
+                    self.stats.from_windows += 1;
+                    continue;
+                }
+            }
+            if budget == 0 && self.faulted >= all_cap && !stored && !kept {
                 continue;
             }
             let past_cap = budget == 0 && self.faulted >= all_cap && !stored;
@@ -983,7 +1017,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} for faulting in several frames, {} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} for faulting in several frames, {} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole; {} pages from windows",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -1014,7 +1048,8 @@ impl Memory {
             s.kinds[2] as f64 / frames,
             s.kinds[3] as f64 / frames,
             s.in_window as f64 / frames,
-            s.copies_sized
+            s.copies_sized,
+            s.from_windows
         );
         self.stats.from = Some((now, self.frame));
     }
