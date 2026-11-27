@@ -54,6 +54,23 @@ What changed:
     without writing their pixel.
 - `6eb38e3`: programs that trace rays store a NaN as 0 (black blocks spread
   over reflections on windows, framed pictures and floors).
+- Ray-traced light (2026-11-27): rooms were near black with ray tracing on
+  and their light pulsed from frame to frame. The structure builder found
+  200-700 pages of title memory a frame without a copy (read as zeros,
+  stores dropped) once a cap of 2,048 pages was spent:
+  - `c831644`: the builder compacts a structure by copying it; only 4 MiB
+    were readied at the copy, so structures over 4 MiB (17 of 937, up to
+    48 MiB) were cut off. Now readied whole from the size the title asked
+    for; a dropped store gets its page. The interrogation room went from
+    near black to lit.
+  - `edf7e74`: pages that keep faulting (3 frames) are taken past the cap,
+    up to 1 GiB (`VICTORY_FAULT_PERSIST`). 300 s with ray tracing at 1080p:
+    22.3 fps, no device loss.
+  - Fault diagnostics: what found a page (load or store, ray program or
+    builder), `VICTORY_FAULT_LIST`, `VICTORY_WINDOW_LIST`.
+- Output 1080p rendered at 1080p by default in the run script
+  (`VICTORY_OUTPUT`, `VICTORY_RENDER_SCALE`): 22.5 fps against 20.0 at 4K,
+  heavy scenes 22.2 against 14.6.
 - Merged avatarmanz's main again and, from [Belobug's AMD fork](https://github.com/Belobug/VIctory-Belobug-AMD)
   (an RX 9070 XT build like this one): streamed textures capped only when VRAM
   is over 92 % full, a pooled indirect buffer, descriptor slots given back
@@ -63,9 +80,11 @@ What changed:
   `VICTORY_LOCK_PROBE=1`, `VICTORY_RT_SKIP=1`.
 
 Known wrong: NPCs' mouths do not move when they talk; the splash video
-judders; some reflections are still off (parts of the title's ray-tracing
-structures are missing, 600-2,000 pages a frame); lighting is not right
-everywhere yet. The CPU side of the memory emulation (~30 ms preparing,
+judders; clear plastic and eyes sparkle (forward-lit "Eight" shaders, with
+or without ray tracing); some rooms are still darker in some shots. Memory
+is tight: a run reaches ~15 GB of VRAM and 11-13 GB of the PC's memory
+shared with the card (copies of title memory outside buffers alone are
+5-8 GB); with swap on it holds, without it the PC's memory runs out. The CPU side of the memory emulation (~30 ms preparing,
 ~24 ms copying back a frame) limits both modes now.
 
 ## How to run it
