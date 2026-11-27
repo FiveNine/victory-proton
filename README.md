@@ -21,25 +21,26 @@ looks around as soon as the game window has the focus; Esc, P or F2 let it go,
 a click in the window takes it again (`VICTORY_MOUSE_SENS`,
 `VICTORY_MOUSE_INVERT_Y=1`, `VICTORY_MOUSE_AUTO=0` for F2 / `~` only).
 
-The pad cannot tell walking from driving or flying, so the layout has three
-modes, picked with **F5** (on foot, the default), **F6** (vehicle: cars, bikes,
-boats) and **F7** (aircraft).
+The pad cannot tell walking from driving, so the driving keys are a mode:
+**F** (enter / leave a vehicle) turns them on and off. **E** sends the same
+button (Y) to interact without turning them over, and **F5** turns them over by
+hand if they are out of step.
 
-| Key | F5 on foot | F6 vehicle | F7 aircraft |
-|---|---|---|---|
-| W / S | move | throttle (RT) / brake, reverse (LT), and the stick | throttle up (RT) / down (LT) |
-| A / D | move | steer | yaw (LB / RB) |
-| Arrows, numpad 8 2 4 6 | D-pad | D-pad | pitch and roll (left stick) |
-| Space | jump, climb (X) | handbrake (RB) | — |
-| Mouse | look | look | look |
-| Left / right button | attack (RT) / aim (LT) | same | same |
-| Shift | sprint (A) | | |
-| F | enter / leave vehicle (Y) | same | same |
-| R | reload, melee (B) | | |
-| Q / Tab | cover (RB) / weapon wheel (LB) | | |
-| Ctrl / C, middle button | crouch (L3) / look behind (R3) | | |
-| E / G / M / Z | interact / D-pad left / phone / D-pad down | | |
-| V / Esc, P / Enter, Backspace | camera / pause / confirm, back (menus) | | |
+| Key | On foot | Driving keys (after F) |
+|---|---|---|
+| W / S | move | throttle (RT) / brake, reverse (LT), and the stick |
+| A / D | move | steer |
+| Numpad 8 2 / 4 6 | — | pitch / roll (left stick: aircraft) |
+| Space | jump, climb (X) | handbrake (RB) |
+| Mouse | look | look |
+| Left / right button | attack (RT) / aim (LT) | same |
+| F / E | enter, leave vehicle (Y, turns the mode over) / interact (Y) | same |
+| Shift | sprint (A) | |
+| R | reload, melee (B) | |
+| Q / Tab | cover (RB) / weapon wheel (LB) | |
+| Ctrl / C, middle button | crouch (L3) / look behind (R3) | |
+| Arrows / G / M / Z | D-pad / D-pad left / phone / D-pad down | |
+| V / Esc, P / Enter, Backspace | camera / pause / confirm, back (menus) | |
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
