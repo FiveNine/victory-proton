@@ -1,7 +1,8 @@
 //! `amd_fidelityfx_loader_xbox.dll`: AMD FidelityFX's API, served by the
 //! host's PC build of it on the host GPU when the user names a folder that
-//! holds one (`VICTORY_FIDELITYFX_DIR`) and selects a 4K FSR profile.
-//! Other profiles keep the title's own console DLLs.
+//! holds one (`VICTORY_FIDELITYFX_DIR`). Without it, or if it offers no
+//! upscaler for the host GPU, this module stays out of the registry and the
+//! title's own console DLLs run as before.
 //!
 //! Both builds have the same API (the FidelityFX SDK's, MIT): five functions
 //! over chains of descriptions, each starting with a type id and the next
@@ -12,16 +13,18 @@
 //! the states the title gives, see `victory_gpu::external`). The rest passes
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
 //! values, the resource descriptions, the context. Only the upscaler: other
-//! effects (frame generation) are refused.
+//! effects the title asks for (frame generation) are refused. A diagnostics
+//! build generates frames itself from the upscale's depth and motion
+//! vectors with `VICTORY_FIDELITYFX_FRAMEGEN=1` (`victory_gpu::external::
+//! frame_generation_inputs`).
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use victory_gpu::object::Object;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
@@ -44,11 +47,8 @@ const DISPATCH_UPSCALE: u64 = 0x1_0001;
 const CONSOLE_BACKEND: u64 = 0x100_0002;
 const HOST_BACKEND: u64 = 2;
 const GET_VERSIONS: u64 = 4;
-const OVERRIDE_VERSION: u64 = 5;
 const GET_PROVIDER_VERSION: u64 = 6;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
-const GET_RENDER_RESOLUTION: u64 = 0x1_0003;
-const DISPLAY_RESOLUTION_MOTION_VECTORS: u32 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -96,20 +96,23 @@ struct DispatchUpscale {
     header: Header,
     list: *mut c_void,
     resources: [Resource; 7],
-    jitter: [f32; 2],
-    motion_scale: [f32; 2],
-    render_size: [u32; 2],
-    upscale_size: [u32; 2],
-    settings: [u32; 10],
+    rest: [u32; 18],
 }
 
-const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
-const _: () = assert!(size_of::<Resource>() == 0x30);
-const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
+// FidelityFX SDK v2.4.0, upscalers/include/ffx_upscale.h.
+const _: () = {
+    use std::mem::offset_of;
+
+    assert!(size_of::<CreateUpscale>() == 0x30);
+    assert!(size_of::<Resource>() == 0x30);
+    assert!(size_of::<DispatchUpscale>() == 0x1b0);
+    assert!(offset_of!(DispatchUpscale, list) == 0x10);
+    assert!(offset_of!(DispatchUpscale, resources) == 0x18); // color
+    assert!(offset_of!(DispatchUpscale, rest) == 0x168); // jitterOffset
+};
 
 /// The versions a backend offers: count in and out, ids, names.
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct GetVersions {
     header: Header,
     create_kind: u64,
@@ -120,27 +123,10 @@ struct GetVersions {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct MemoryUsageWithDevice {
-    header: Header,
-    device: *mut c_void,
-    max_render: [u32; 2],
-    max_output: [u32; 2],
-    flags: u32,
-    usage: *mut c_void,
-}
-
-#[repr(C)]
 struct ProviderVersion {
     header: Header,
     id: u64,
     name: *const c_char,
-}
-
-#[repr(C)]
-struct OverrideVersion {
-    header: Header,
-    id: u64,
 }
 
 type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
@@ -149,25 +135,12 @@ type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 type Call = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
 
 struct Host {
-    _library: Library,
     create: Create,
     destroy: Destroy,
     configure: Call,
     query: Call,
     dispatch: Call,
     device: ID3D12Device,
-    provider_id: u64,
-}
-
-struct Library(windows_sys::Win32::Foundation::HMODULE);
-
-impl Drop for Library {
-    fn drop(&mut self) {
-        // SAFETY: this owns the reference acquired by LoadLibraryExW.
-        unsafe {
-            windows_sys::Win32::Foundation::FreeLibrary(self.0);
-        }
-    }
 }
 
 // SAFETY: D3D12 devices are free-threaded; the rest is code.
@@ -176,52 +149,6 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 static HOST: OnceLock<Host> = OnceLock::new();
-struct Context {
-    // Serializes recording and destruction for this particular temporal history.
-    live: Mutex<bool>,
-    first_dispatch: std::sync::Once,
-    // The FFX API requires pointers in the creation descriptor to remain
-    // live through destroy, including our replacement backend.
-    creation: CreateChain,
-}
-
-struct CreateChain {
-    description: Box<CreateUpscale>,
-    _backend: Box<Backend>,
-    _version: Box<OverrideVersion>,
-}
-
-// SAFETY: after Create, the boxed descriptors are retained immutably.
-// The device is held by Host; the remaining extension pointers belong
-// to the title under the FFX context lifetime contract.
-unsafe impl Send for CreateChain {}
-// SAFETY: as above, no thread mutates the retained descriptors.
-unsafe impl Sync for CreateChain {}
-
-static CONTEXTS: Mutex<BTreeMap<usize, Arc<Context>>> = Mutex::new(BTreeMap::new());
-
-fn fits(extent: [u32; 2], maximum: [u32; 2]) -> bool {
-    extent[0] != 0 && extent[1] != 0 && extent[0] <= maximum[0] && extent[1] <= maximum[1]
-}
-
-fn dispatch_output(
-    render: [u32; 2],
-    output: [u32; 2],
-    max_render: [u32; 2],
-    max_output: [u32; 2],
-) -> Option<[u32; 2]> {
-    let output = if output == [0, 0] { max_output } else { output };
-    (fits(render, max_render) && fits(output, max_output) && fits(render, output)).then_some(output)
-}
-
-fn minimum_extent(index: usize, flags: u32, render: [u32; 2], output: [u32; 2]) -> [u32; 2] {
-    match index {
-        6 => output,
-        2 if flags & DISPLAY_RESOLUTION_MOTION_VECTORS != 0 => output,
-        3 => [1, 1], // Optional exposure texture.
-        _ => render,
-    }
-}
 
 macro_rules! once {
     ($level:ident, $($arg:tt)*) => {{
@@ -230,13 +157,37 @@ macro_rules! once {
     }};
 }
 
-/// Select the PC provider before the title's import registry is initialized.
-pub fn use_host_dir(dir: &Path) -> Result<(), String> {
-    let (host, version) = load(dir)?;
-    HOST.set(host)
-        .map_err(|_| String::from("FidelityFX provider already initialized"))?;
-    tracing::info!(folder = %dir.display(), version, "FidelityFX: selected PC upscaler");
-    Ok(())
+/// Serves the title's FidelityFX calls with the PC upscaler in `dir`
+/// (`VICTORY_FIDELITYFX_DIR`) if it offers one for the host GPU; else the
+/// title's own DLLs run. Call once, before the import registry is first
+/// used: it holds this module only when serving.
+pub fn use_host_dir(dir: Option<&Path>) {
+    let Some(dir) = dir else {
+        tracing::info!(
+            "no FidelityFX folder (VICTORY_FIDELITYFX_DIR): a title's own FidelityFX DLLs run"
+        );
+        return;
+    };
+    match load(dir) {
+        Ok((host, versions)) => {
+            tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
+            let _ = HOST.set(host);
+            victory_gpu::external::enable_host_fidelityfx();
+            #[cfg(feature = "diagnostics")]
+            if let Ok(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
+                && matches!(mode.as_str(), "1" | "4")
+            {
+                match victory_gpu::external::use_frame_generation(dir, mode == "4") {
+                    Ok(dll) => tracing::info!(dll, mode, "FidelityFX: frame generation on the title's upscaled frames"),
+                    Err(why) => tracing::warn!("FidelityFX frame generation: {why}; off"),
+                }
+            }
+        }
+        Err(why) => tracing::warn!(
+            folder = %dir.display(),
+            "FidelityFX: {why}; the title's own DLLs run"
+        ),
+    }
 }
 
 /// Whether the host's FidelityFX serves the title's.
@@ -266,7 +217,6 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
             std::io::Error::last_os_error()
         ));
     }
-    let library = Library(module);
     let find = |name: &CStr| {
         // SAFETY: a loaded module and a NUL-terminated name.
         unsafe { GetProcAddress(module, name.as_ptr().cast()) }
@@ -274,32 +224,24 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
             .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
     };
     let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
-    // SAFETY: the SDK's ffxQuery export, with its declared signature.
-    let query = unsafe { std::mem::transmute::<*const c_void, Call>(find(c"ffxQuery")?) };
-    let (provider_id, version) = select_version(query, &device)?;
     // SAFETY: the API's exports, with its signatures.
     let host = unsafe {
         Host {
             create: std::mem::transmute::<*const c_void, Create>(find(c"ffxCreateContext")?),
             destroy: std::mem::transmute::<*const c_void, Destroy>(find(c"ffxDestroyContext")?),
             configure: std::mem::transmute::<*const c_void, Call>(find(c"ffxConfigure")?),
-            query,
+            query: std::mem::transmute::<*const c_void, Call>(find(c"ffxQuery")?),
             dispatch: std::mem::transmute::<*const c_void, Call>(find(c"ffxDispatch")?),
-            _library: library,
             device,
-            provider_id,
         }
     };
-    Ok((host, version))
+    let versions = versions(&host)?;
+    Ok((host, versions))
 }
 
-fn is_fsr_4_1_2(name: &str) -> bool {
-    name.strip_prefix("4.1.2")
-        .is_some_and(|suffix| !suffix.starts_with(|c: char| c.is_ascii_digit()))
-}
-
-/// The SDK supplies the version id to put in the context creation chain.
-fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String), String> {
+/// The upscaler versions the host DLL offers for the host GPU, by name; an
+/// error if none.
+fn versions(host: &Host) -> Result<String, String> {
     let mut count = 0u64;
     let mut query = GetVersions {
         header: Header {
@@ -307,46 +249,29 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             next: null_mut(),
         },
         create_kind: CREATE_UPSCALE,
-        device: device.as_raw(),
+        device: host.device.as_raw(),
         count: &mut count,
         ids: null_mut(),
         names: null_mut(),
     };
     // SAFETY: a version query naming the host device.
-    let code = unsafe { query_fn(null_mut(), &mut query.header) };
+    let code = unsafe { (host.query)(null_mut(), &mut query.header) };
     if code != OK || count == 0 {
         return Err(format!(
             "it offers no upscaler for the host GPU (code {code})"
         ));
     }
     let mut names = vec![null::<c_char>(); count as usize];
-    let mut ids = vec![0u64; names.len()];
     query.names = names.as_mut_ptr();
-    query.ids = ids.as_mut_ptr();
     // SAFETY: as above, with room for `count` names.
-    let code = unsafe { query_fn(null_mut(), &mut query.header) };
-    if code != OK {
-        return Err(format!(
-            "upscaler version names could not be queried (code {code})"
-        ));
-    }
-    let mut available = Vec::new();
-    for (id, name) in ids.into_iter().zip(names).take(count as usize) {
-        if !name.is_null() {
-            // SAFETY: NUL-terminated name owned by the SDK.
-            let name = unsafe { CStr::from_ptr(name) }
-                .to_string_lossy()
-                .into_owned();
-            if is_fsr_4_1_2(&name) {
-                return Ok((id, name));
-            }
-            available.push(name);
-        }
-    }
-    Err(format!(
-        "no FSR 4.1.2 provider for this adapter (available: {})",
-        available.join(", ")
-    ))
+    unsafe { (host.query)(null_mut(), &mut query.header) };
+    Ok(names
+        .iter()
+        .filter(|n| !n.is_null())
+        // SAFETY: NUL-terminated names the DLL keeps.
+        .map(|&n| unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 /// Puts the host backend after the title's upscaler description, in place
@@ -404,23 +329,15 @@ extern "C" fn ffxCreateContext(
         return NO_PROVIDER;
     }
     // SAFETY: an upscaler description, by its type.
-    let mut upscale = Box::new(unsafe { desc.cast::<CreateUpscale>().read() });
-    let mut backend = Box::new(Backend {
+    let mut upscale = unsafe { desc.cast::<CreateUpscale>().read() };
+    let mut backend = Backend {
         header: Header {
             kind: HOST_BACKEND,
             next: null_mut(),
         },
         device: host.device.as_raw(),
-    });
+    };
     link(&mut upscale, &mut backend);
-    let mut requested = Box::new(OverrideVersion {
-        header: Header {
-            kind: OVERRIDE_VERSION,
-            next: backend.header.next,
-        },
-        id: host.provider_id,
-    });
-    backend.header.next = &raw mut requested.header;
     // SAFETY: a PC chain; the title's later descriptions live for the call.
     let code = unsafe { (host.create)(context, &mut upscale.header, memory) };
     if code != OK {
@@ -436,24 +353,10 @@ extern "C" fn ffxCreateContext(
         name: null(),
     };
     // SAFETY: a provider query on the context just made.
-    let query_code = unsafe { (host.query)(context, &mut version.header) };
+    unsafe { (host.query)(context, &mut version.header) };
     // SAFETY: a NUL-terminated name the DLL keeps, if any.
     let name = (!version.name.is_null())
         .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
-    if query_code != OK
-        || version.id != host.provider_id
-        || !name.as_deref().is_some_and(is_fsr_4_1_2)
-    {
-        tracing::warn!(
-            query_code,
-            provider = name.as_deref().unwrap_or("?"),
-            "FidelityFX created a different provider than the requested 4.1.2"
-        );
-        // SAFETY: the PC provider just created the context with this allocator.
-        unsafe { (host.destroy)(context, memory) };
-        return NO_PROVIDER;
-    }
-    // SAFETY: a successful SDK creation wrote an opaque context into this slot.
     tracing::info!(
         provider = name.as_deref().unwrap_or("?"),
         id = format_args!("{:#x}", version.id),
@@ -462,56 +365,29 @@ extern "C" fn ffxCreateContext(
         flags = format_args!("{:#x}", upscale.flags),
         "FidelityFX: upscaler context on the host"
     );
-    CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).insert(
-        unsafe { *context } as usize,
-        Arc::new(Context {
-            live: Mutex::new(true),
-            first_dispatch: std::sync::Once::new(),
-            creation: CreateChain {
-                description: upscale,
-                _backend: backend,
-                _version: requested,
-            },
-        }),
-    );
+    // SAFETY: a successful create wrote the context.
+    #[cfg(feature = "diagnostics")]
+    context_flags(|f| f.insert(unsafe { *context } as usize, upscale.flags));
     OK
 }
 
+/// The creation flags of each upscaler context, for frame generation's
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn context_flags<R>(f: impl FnOnce(&mut std::collections::HashMap<usize, u32>) -> R) -> R {
+    static FLAGS: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> = std::sync::Mutex::new(None);
+    f(FLAGS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+}
+
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
-    if context.is_null() {
-        return PARAMETER;
+    #[cfg(feature = "diagnostics")]
+    if !context.is_null() {
+        // SAFETY: the title passes its context slot.
+        context_flags(|f| f.remove(&(unsafe { *context } as usize)));
     }
-    // SAFETY: the title passes its context. Capture its value before destroy clears it.
-    let handle = unsafe { *context } as usize;
-    let ctx = CONTEXTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&handle)
-        .cloned();
-    let Some(ctx) = ctx else { return PARAMETER };
-    let mut live = ctx.live.lock().unwrap_or_else(|e| e.into_inner());
-    if !*live {
-        return PARAMETER;
-    }
-    // The guest releases a context after submitting its frames. The host
-    // may still be executing their lists, even after guest Execute returns.
-    victory_gpu::external::finish_submitted();
-    let code = unsafe { (host.destroy)(context, memory) };
-    if code == OK {
-        *live = false;
-        let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
-        // A concurrent Create may already have reused the released SDK address.
-        if contexts
-            .get(&handle)
-            .is_some_and(|current| Arc::ptr_eq(current, &ctx))
-        {
-            contexts.remove(&handle);
-        }
-    }
-    code
+    // SAFETY: the title passes its context.
+    HOST.get()
+        .map_or(NO_PROVIDER, |h| unsafe { (h.destroy)(context, memory) })
 }
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
@@ -530,27 +406,17 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
-    // Substitute the native device; the SDK returns values through the
-    // title's original output pointers in both request structures.
-    if kind == GET_VERSIONS {
-        let mut query = unsafe { *desc.cast::<GetVersions>() };
-        query.device = host.device.as_raw();
-        return unsafe { (host.query)(context, &mut query.header) };
-    }
-    if kind == MEMORY_USAGE_WITH_DEVICE {
-        let mut query = unsafe { *desc.cast::<MemoryUsageWithDevice>() };
-        query.device = host.device.as_raw();
-        return unsafe { (host.query)(context, &mut query.header) };
+    // These carry the console device.
+    if kind == GET_VERSIONS || kind == MEMORY_USAGE_WITH_DEVICE {
+        once!(
+            warn,
+            kind = format_args!("{kind:#x}"),
+            "FidelityFX: a query naming a device was refused"
+        );
+        return PARAMETER;
     }
     // SAFETY: as above.
-    let code = unsafe { (host.query)(context, desc) };
-    if kind == GET_RENDER_RESOLUTION && code != OK {
-        tracing::warn!(
-            code,
-            "FidelityFX provider refused the render-resolution query"
-        );
-    }
-    code
+    unsafe { (host.query)(context, desc) }
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
@@ -572,146 +438,95 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
-    if context.is_null() {
-        once!(warn, "FidelityFX dispatch arrived without a context");
-        return PARAMETER;
-    }
-    if let Some(index) = [0, 1, 2, 6]
-        .into_iter()
-        .find(|&i| dispatch.resources[i].resource.is_null())
-    {
-        once!(
-            warn,
-            index,
-            "FidelityFX dispatch is missing a required texture"
-        );
-        return PARAMETER;
-    }
-    // SAFETY: the title passes the same opaque context slot as for creation.
-    let handle = unsafe { *context } as usize;
-    let ctx = CONTEXTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&handle)
-        .cloned();
-    let Some(ctx) = ctx else {
-        once!(
-            warn,
-            "FidelityFX dispatch referenced an unregistered context"
-        );
-        return PARAMETER;
+    let title_list = dispatch.list.cast::<Object>().cast_const();
+    // The host list as the title's calls so far left it: with `VICTORY_THIN`
+    // they are translated now, on this thread (`victory_gpu::external::
+    // on_host_list`); without that the color had no host copy at the call and
+    // the upscaling never ran (a black screen).
+    let run = move |list: *const Object| -> u32 {
+        // Depth and motion as the title names them, for frame generation.
+        #[cfg(feature = "diagnostics")]
+        let title = dispatch;
+        // Alive for the call (the list holds them too).
+        let mut textures = Vec::new();
+        for (index, r) in dispatch
+            .resources
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, r)| !r.resource.is_null())
+        {
+            let wanted = host_state(r.state);
+            let found = wanted.and_then(|w| victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w));
+            let texture = found.clone().filter(|&(_, state)| Some(state) == wanted);
+            let Some((texture, _)) = texture else {
+                // Which of the dispatch's resources (0 color, 1 depth, 2 motion
+                // vectors, then exposure, reactive, transparency, output), and
+                // whether it has no host copy or one that cannot take the state.
+                once!(
+                    warn,
+                    state = r.state,
+                    index,
+                    wanted = ?wanted,
+                    host = ?found.as_ref().map(|(t, state)| (state, unsafe { t.GetDesc() }.Flags.0, unsafe { t.GetDesc() }.Format.0)),
+                    "FidelityFX: a resource has no host texture in its state; the upscaling did not run"
+                );
+                return PARAMETER;
+            };
+            r.resource = texture.as_raw();
+            textures.push(texture);
+        }
+        once!(info, formats = ?textures.iter().map(|t| {
+            // SAFETY: a live texture.
+            unsafe { t.GetDesc() }.Format.0
+        }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
+        let code = victory_gpu::external::record(list, |host_list| {
+            dispatch.list = host_list.as_raw();
+            // SAFETY: the PC dispatch on host objects; the context is the host's.
+            unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
+        })
+        .unwrap_or(PARAMETER);
+        #[cfg(feature = "diagnostics")]
+        if code == OK && !context.is_null() {
+            // SAFETY: the title passes its context slot.
+            let flags = context_flags(|f| f.get(&(unsafe { *context } as usize)).copied()).unwrap_or(0);
+            let (depth, motion) = (title.resources[1], title.resources[2]);
+            if !depth.resource.is_null() && !motion.resource.is_null() {
+                let frame = frame_inputs(&title, flags);
+                once!(info, result = code, render = ?frame.render, "FidelityFX: first successful host upscale");
+                victory_gpu::external::frame_generation_inputs(
+                    list,
+                    depth.resource.cast::<Object>().cast_const(),
+                    motion.resource.cast::<Object>().cast_const(),
+                    frame,
+                );
+            }
+        }
+        code
     };
-    let live = ctx.live.lock().unwrap_or_else(|e| e.into_inner());
-    if !*live {
-        return PARAMETER;
-    }
-    let create = &ctx.creation.description;
-    let Some(output_size) = dispatch_output(
-        dispatch.render_size,
-        dispatch.upscale_size,
-        create.max_render,
-        create.max_output,
-    ) else {
-        once!(warn, render = ?dispatch.render_size, output = ?dispatch.upscale_size,
-            max_render = ?create.max_render, max_output = ?create.max_output,
-            "FidelityFX rejected dispatch dimensions outside the context's allocations");
-        return PARAMETER;
-    };
-    let list = dispatch.list.cast::<Object>().cast_const();
-    victory_gpu::external::record(list, |list| {
-        record_dispatch(list, host, context, &ctx, &mut dispatch, output_size)
-    })
-    .unwrap_or_else(|| {
-        once!(
-            warn,
-            "FidelityFX could not record to the title command list"
-        );
+    victory_gpu::external::on_host_list(title_list, run).unwrap_or_else(|| {
+        once!(warn, "FidelityFX: the title's list has no host list; the upscaling did not run");
         PARAMETER
     })
 }
 
-fn record_dispatch(
-    list: &victory_gpu::external::Recording<'_>,
-    host: &Host,
-    context: *mut *mut c_void,
-    ctx: &Context,
-    dispatch: &mut DispatchUpscale,
-    output_size: [u32; 2],
-) -> u32 {
-    let output = dispatch.resources[6].resource.cast::<Object>();
-    // Alive for the call (the list holds them too).
-    let mut textures = Vec::new();
-    let mut backing_extents = [None; 7];
-    for (index, r) in dispatch.resources.iter_mut().enumerate() {
-        if r.resource.is_null() {
-            continue;
-        }
-        if index < 6 && list.prepare_input(r.resource.cast::<Object>()).is_none() {
-            once!(
-                warn,
-                index,
-                "FidelityFX input could not be prepared on the title command list"
-            );
-            return PARAMETER;
-        }
-        let wanted = host_state(r.state);
-        let texture = wanted.and_then(|w| {
-            list.texture(r.resource.cast::<Object>(), w)
-                .filter(|&(_, state)| state == w)
-        });
-        let Some((texture, _)) = texture else {
-            once!(
-                warn,
-                index,
-                state = r.state,
-                "FidelityFX: a resource has no host texture in its state; the upscaling did not run"
-            );
-            return PARAMETER;
-        };
-        let desc = unsafe { texture.GetDesc() };
-        backing_extents[index] = Some((desc.Width, desc.Height));
-        let needed = minimum_extent(
-            index,
-            ctx.creation.description.flags,
-            dispatch.render_size,
-            output_size,
-        );
-        if desc.Width < u64::from(needed[0]) || desc.Height < needed[1] {
-            once!(
-                warn,
-                index,
-                ?needed,
-                width = desc.Width,
-                height = desc.Height,
-                "FidelityFX resource cannot cover the active dispatch rectangle"
-            );
-            return PARAMETER;
-        }
-        r.resource = texture.as_raw();
-        textures.push(texture);
+/// What frame generation needs of an upscaling (`rest` in the order of
+/// `ffxDispatchDescUpscale`: jitter, motion-vector scale, render size,
+/// output size, sharpening, sharpness, frame time, pre-exposure, reset,
+/// camera, flags) and its context's creation `flags`.
+#[cfg(feature = "diagnostics")]
+fn frame_inputs(d: &DispatchUpscale, flags: u32) -> victory_gpu::external::FrameInputs {
+    let f = |i: usize| f32::from_bits(d.rest[i]);
+    victory_gpu::external::FrameInputs {
+        render: [d.rest[4], d.rest[5]],
+        jitter: [f(0), f(1)],
+        motion_scale: [f(2), f(3)],
+        frame_time_ms: f(10),
+        reset: d.rest[12] & 0xff != 0,
+        camera: [f(13), f(14), f(15), f(16)],
+        flags,
+        depth_desc: d.resources[1].description,
+        motion_desc: d.resources[2].description,
     }
-    once!(info, formats = ?textures.iter().map(|t| {
-        // SAFETY: a live texture.
-        unsafe { t.GetDesc() }.Format.0
-    }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    dispatch.list = list.commands().as_raw();
-    // SAFETY: the PC dispatch on host objects. The context is live and locked.
-    let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
-    if code == OK {
-        victory_gpu::external::output_written(output);
-        ctx.first_dispatch.call_once(|| {
-            tracing::info!(render = ?dispatch.render_size, output = ?output_size, ?backing_extents,
-                jitter = ?dispatch.jitter, motion_vector_scale = ?dispatch.motion_scale,
-                "FidelityFX 4 recorded the title's temporal dispatch");
-        });
-    } else {
-        once!(
-            warn,
-            code,
-            "FidelityFX 4 provider rejected the title dispatch"
-        );
-    }
-    code
 }
 
 pub(crate) fn module() -> HleModule {
@@ -731,47 +546,6 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn validates_logical_rectangles_against_the_current_context() {
-        for display in [[1920, 1080], [2560, 1440], [3840, 2160]] {
-            for divisor in [1.0_f32, 1.5, 1.7, 2.0, 3.0] {
-                let render = display.map(|v| (v as f32 / divisor) as u32);
-                assert_eq!(
-                    dispatch_output(render, display, render, display),
-                    Some(display)
-                );
-                assert_eq!(
-                    dispatch_output(render, [0, 0], render, display),
-                    Some(display)
-                );
-                assert_eq!(minimum_extent(2, 0x29, render, display), render);
-                assert_eq!(minimum_extent(2, 0x2b, render, display), display);
-                assert_eq!(minimum_extent(6, 0x29, render, display), display);
-                assert_eq!(minimum_extent(3, 0x29, render, display), [1, 1]);
-            }
-        }
-        assert_eq!(
-            dispatch_output([0, 720], [0, 0], [1280, 720], [2560, 1440]),
-            None
-        );
-        assert_eq!(
-            dispatch_output([1281, 720], [0, 0], [1280, 720], [2560, 1440]),
-            None
-        );
-        assert_eq!(
-            dispatch_output([1280, 720], [0, 1440], [1280, 720], [2560, 1440]),
-            None
-        );
-        assert_eq!(
-            dispatch_output([1280, 720], [3000, 1440], [1280, 720], [2560, 1440]),
-            None
-        );
-        assert_eq!(
-            dispatch_output([1280, 720], [960, 540], [1280, 720], [2560, 1440]),
-            None
-        );
-    }
 
     fn header(kind: u64, next: *mut Header) -> Header {
         Header { kind, next }
@@ -825,6 +599,29 @@ mod tests {
             resolver.classify("amd_fidelityfx_loader_xbox.dll", &symbol),
             None
         );
+    }
+
+    /// Frame generation reads the upscale's constants from their places in
+    /// the description.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn frame_generation_reads_the_upscales_constants() {
+        let mut rest = [0u32; 18];
+        let floats = [(0, 0.25f32), (1, -0.5), (2, 1920.0), (3, 1080.0), (10, 33.3), (13, 0.1), (14, 1000.0), (15, 1.2), (16, 1.0)];
+        for (i, v) in floats {
+            rest[i] = v.to_bits();
+        }
+        (rest[4], rest[5], rest[12]) = (1920, 1080, 1);
+        let mut resources = [Resource { resource: null_mut(), description: [0; 8], state: 0 }; 7];
+        resources[1].description[1] = 7;
+        resources[2].description[1] = 9;
+        let d = DispatchUpscale { header: header(DISPATCH_UPSCALE, null_mut()), list: null_mut(), resources, rest };
+        let f = frame_inputs(&d, 0x29);
+        assert_eq!(f.render, [1920, 1080]);
+        assert_eq!((f.jitter, f.motion_scale), ([0.25, -0.5], [1920.0, 1080.0]));
+        assert_eq!((f.frame_time_ms, f.reset, f.flags), (33.3, true, 0x29));
+        assert_eq!(f.camera, [0.1, 1000.0, 1.2, 1.0]);
+        assert_eq!((f.depth_desc[1], f.motion_desc[1]), (7, 9));
     }
 
     #[test]

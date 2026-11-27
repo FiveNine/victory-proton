@@ -24,13 +24,6 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
-/// The same table as [`SLOT_STRIDES`], bound for a shader that asks the
-/// format kind of views in its descriptor tables (`RootType::Table`), not
-/// of views it picks from the heap: the host binds it without the pass over
-/// the heap's buffer views that [`SLOT_STRIDES`] asks for. (After
-/// codec-d/cool_fox f4b48ad: the title's `compute_graph_ops` facial and
-/// wrapped-mesh solver reads 16-bit data of integer views through tables.)
-pub const SLOT_TABLE_STRIDES: u8 = 252;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -113,6 +106,8 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil ([`super::lower::early_depth`]).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -263,6 +258,10 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// The part of [`Self::lds_dwords`] the console program declares, in
+    /// dwords; the layer's own dwords (lane exchange, wave order) follow it.
+    /// LDS instructions reach only this part, as on the console.
+    pub lds_title_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -316,6 +315,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            lds_title_dwords: 0,
             lds: None,
             main,
             entry,
@@ -915,7 +915,6 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        self.m.single_latches();
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());

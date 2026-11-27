@@ -84,6 +84,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     while let Some(mut offset) = pending.pop() {
         while !found.contains_key(&offset) {
             let inst = instruction(code, offset)?;
+            sgpr_destination(&inst)?;
             let next = offset + 4 * inst.words.len();
             let flow = control(&inst, code.len(), |at| {
                 found.range(..at).next_back().map(|(_, i)| i)
@@ -217,7 +218,16 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
-            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
+            0x3F => {
+                let opcode = (w >> 9) & 0xFF;
+                // These VOP1s take no source, so the field is not a literal:
+                // the console's compiler stores a shader hash there, and where
+                // it fell on 0xFF/0xF9/0xFA/0xE9/0xEA the next instruction was
+                // taken for its literal and lost (ZigZagBoi1/ScarlettPort
+                // bc71157, PR #19).
+                let no_source = matches!(opcode, 0x000 | 0x01B | 0x041);
+                (Encoding::Vop1, opcode, if no_source { 1 } else { 1 + extra })
+            }
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -301,6 +311,25 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     })
 }
 
+/// VOP3 compares, `v_readlane_b32` and `v_readfirstlane_b32` name their SGPR
+/// in eight bits: codes from 128 up are no register ([`Operand::Scalar`]
+/// promises none; the IR takes them for parked scalars). `v_cmpx` writes
+/// EXEC whatever the field holds.
+fn sgpr_destination(inst: &Instruction) -> Result<(), ShaderError> {
+    if !matches!(inst.encoding, Encoding::Vop1 | Encoding::Vop3)
+        || inst.name().is_none_or(|n| n.starts_with("v_cmpx"))
+    {
+        return Ok(());
+    }
+    match inst.fields(false) {
+        Fields::Valu(Valu {
+            dst: Some(Operand::Scalar { code, .. }),
+            ..
+        }) if code >= 128 => Err(isa(inst.offset, "an SGPR destination past exec_hi")),
+        _ => Ok(()),
+    }
+}
+
 fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
     use opcodes as t;
     let (table, op) = match encoding {
@@ -376,6 +405,12 @@ mod tests {
         // unsigned, so bit 11 is ignored (0x800 -> 0, 0xfff -> 0x7ff).
         assert_eq!(offset(0xDC30_0800), 0);
         assert_eq!(offset(0xDC30_0FFF), 0x7FF);
+    }
+
+    #[test]
+    fn vop1_without_operands_has_no_extension_word() {
+        assert_eq!(summary(&[0x7E00_00FF, S_ENDPGM]), [(0, 1, "v_nop"), (4, 1, "s_endpgm")]);
+        assert_eq!(summary(&[0x7E00_36FF, S_ENDPGM]), [(0, 1, "v_pipeflush"), (4, 1, "s_endpgm")]);
     }
 
     #[test]
@@ -518,5 +553,26 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    #[test]
+    fn rejects_sgpr_destinations_past_exec_hi() {
+        // VOP3 compares and v_readlane name their SGPR in eight bits; the IR
+        // took codes from 128 up for parked scalars and indexed past its
+        // table of machine ones.
+        let ok = |words: &[u32]| decode(&bytes(words)).is_ok();
+        assert!(ok(&[0xD401_0006, 0x0001_E501, S_ENDPGM])); // v_cmp_lt_f32 s6, v1, 1.0
+        assert!(ok(&[0x7E04_0505, S_ENDPGM])); // v_readfirstlane_b32 s2, v5
+        assert!(ok(&[0xD760_0002, 0x0000_0101, S_ENDPGM])); // v_readlane_b32 s2, v1, s0
+        for code in [
+            [0xD401_009F, 0x0001_E501, S_ENDPGM],
+            [0x7F9E_0405, S_ENDPGM, S_ENDPGM],
+            [0xD760_0080, 0x0000_0101, S_ENDPGM],
+        ] {
+            assert!(crate::ir::build(&bytes(&code), false, 256).is_err());
+            assert!(!ok(&code), "{code:08X?}");
+        }
+        // v_cmpx writes EXEC whatever its destination field holds.
+        assert!(ok(&[0xD411_009F, 0x0001_E501, S_ENDPGM]));
     }
 }

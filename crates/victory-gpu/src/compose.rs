@@ -1,6 +1,6 @@
 //! Two presented planes as one image: the console's display puts the second
 //! (the interface) over the first (the scene), each scaled to the screen.
-//! Grand Theft Auto VI presents so on Series S.
+//! the title presents so on Series S.
 //!
 //! From the codec-d/cool_fox fork (641835a4, 581b0cb9). Only with
 //! `VICTORY_PLANES=1` ([`on`]); else the first plane is shown alone, as before.
@@ -84,11 +84,11 @@ impl Composer {
         );
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
-            let bytes = |b: &ID3DBlob| {
-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            // Not the blob: under Wine the host refuses the signature inside
+            // it (E_FAIL), while a description read from the source's `RS`
+            // and serialized here works, as the title's own signatures do.
+            let root: ID3D12RootSignature = crate::rootstring::make(device, SOURCE)?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),

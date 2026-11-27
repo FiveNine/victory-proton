@@ -103,13 +103,6 @@ fn build() -> [u8; 32] {
         };
         bytes.extend_from_slice(&FORMAT.to_le_bytes());
         bytes.extend_from_slice(&limit.to_le_bytes());
-        // (So is the limit of walks through ray-tracing structures; the
-        // default adds nothing, so caches made before it stay good.)
-        let walks = victory_shader::emit::walk_limit();
-        if walks != victory_shader::emit::DEFAULT_WALK_LIMIT {
-            bytes.extend_from_slice(b"walks");
-            bytes.extend_from_slice(&walks.to_le_bytes());
-        }
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:
@@ -130,7 +123,11 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_EARLY_DEPTH",
+            "VICTORY_D16_BITS",
             "VICTORY_NAN_GUARD",
+            "VICTORY_SPILL_STRICT",
+            "VICTORY_LIMIT_EXITS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -146,15 +143,6 @@ fn build() -> [u8; 32] {
         // their key.
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
-        }
-        // The same of `VICTORY_BVH_SLOT_BOUNDS=1` (a picked structure past
-        // the address table is a zero record) and `VICTORY_RAY_PROBE=1`
-        // (node tests count what they find): only when on.
-        if victory_shader::emit::slot_bounds() {
-            bytes.extend_from_slice(b"VICTORY_BVH_SLOT_BOUNDS=1");
-        }
-        if victory_shader::emit::ray_probe() {
-            bytes.extend_from_slice(b"VICTORY_RAY_PROBE=1");
         }
         bytes
     });
@@ -386,6 +374,11 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -456,6 +449,11 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some((
         HostShader {
         stage,
@@ -467,6 +465,7 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+            half_views,
         },
         made_by,
     ))
@@ -503,6 +502,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

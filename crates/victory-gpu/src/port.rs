@@ -1,7 +1,7 @@
 //! Renderer port #1: the title's 32-bit graphics heap as the card's own
 //! memory (`VICTORY_PORT_CONSTANTS`, off by default).
 //!
-//! What the title does (game_scarlett_master.exe, the routine at image
+//! What the title does (the title's executable, the routine at image
 //! +0x1e86440, reached at its start): one `XMemVirtualAlloc` of the five
 //! sizes it is given together (kind 0x42000: a reservation of 64 KiB
 //! pages, flags 7: graphics memory below 4 GiB, 185 MB at 0x34310000 in
@@ -50,7 +50,6 @@
 //! nothing waits for them. The title's constants are its CPU's; how many
 //! such steps there are is on the frame-rate line ([`log`]).
 
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,6 +101,9 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// ported memory on the CPU, their bytes, buffer copies on the CPU that
 /// touch it, their bytes.
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+
+/// Regions of private memory opened since the start ([`open_private`]).
+static PRIVATE_REGIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
 /// memory.
@@ -168,11 +170,45 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
     Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
 }
 
+/// Whether the card reads and writes the pages of a section's view opened in
+/// place, asked once of `device` ([`crate::inplace::probe`], on memory of
+/// its own). Under Proton (vkd3d-proton on RADV, 2026-11-26) the opening
+/// succeeds but the card sees other pages: the title's constants read as
+/// zeros and the screen stays black. Where it does not, the port stays off
+/// and everything goes as without it.
+fn sections_seen(device: &ID3D12Device) -> bool {
+    static SEEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEEN.get_or_init(|| {
+        // Under Wine it is known, and asking costs the device: a submission
+        // that uses a section in place is rejected (runs play-lost and the
+        // parallel GPU tests that crashed with it).
+        if crate::shadow::on_wine() {
+            tracing::warn!("renderer port 1 (VICTORY_PORT_CONSTANTS=1): sections are not seen in place under Wine; only private memory is placed");
+            return false;
+        }
+        let probe = crate::inplace::probe(device, &|| None, 0);
+        let seen = probe.section_reads && probe.section_writes;
+        if !seen {
+            tracing::warn!(
+                reads = probe.section_reads,
+                writes = probe.section_writes,
+                "renderer port 1 (VICTORY_PORT_CONSTANTS=1) stays off: the card does not see a section's pages opened in place on this system"
+            );
+        }
+        seen
+    })
+}
+
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
-    if let Some((first, bytes)) = private_stretch(at, end) {
-        return open_private(device, first, bytes);
+    // Private memory (the 32-bit heap's pages under Wine, `xmem`'s
+    // `map_private`): the allocation that holds it, opened where it is.
+    if crate::inplace::private_whole(at as usize, (end - at) as usize) {
+        return open_private(device, at, end);
+    }
+    if !sections_seen(device) {
+        return Err((5, "the card does not see a section's pages in place here".into()));
     }
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
@@ -226,6 +262,45 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             unmap();
             Err((5, format!("refused by the host: {e}")))
         }
+    }
+}
+
+/// [`open_region`] of private memory: the stretch of it that holds `[at,
+/// end)` (one allocation, read-write, kept to what may be ported), opened as
+/// a host heap at the title's own address. The runtime lets it go
+/// (`crate::inplace::title_memory_freeing`) and waits for the card before
+/// it gives the memory up.
+fn open_private(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    if unsafe { mem::VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return Err((3, "not known to the host".to_owned()));
+    }
+    let mut first = info.BaseAddress as u64;
+    let mut bytes = info.RegionSize as u64;
+    if first < LOW && first + bytes > LOW {
+        bytes = LOW.saturating_sub(first);
+    }
+    if bytes > MOST {
+        (first, bytes) = (at, end - at);
+    }
+    if first > at || first + bytes < end || !first.is_multiple_of(K64) || !bytes.is_multiple_of(K64) {
+        return Err((3, format!("the private stretch {first:#x}+{bytes:#x} does not hold it")));
+    }
+    match crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)) {
+        Ok(heap) => {
+            let n = PRIVATE_REGIONS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 32 || n.is_power_of_two() {
+                tracing::info!(
+                    start = format_args!("{first:#x}"),
+                    bytes,
+                    "renderer port 1: a stretch of the title's graphics memory, private memory, opened as a host heap where it is"
+                );
+            }
+            Ok(Region { start: first, end: first + bytes, heap })
+        }
+        Err(e) => Err((5, format!("refused by the host: {e}"))),
     }
 }
 
@@ -334,6 +409,48 @@ mod tests {
         assert!(!low(u64::MAX, 2));
     }
 
+    /// Private memory where a placeholder was, as `xmem` maps the 32-bit
+    /// heap's pages under Wine: opened where it is, the card reads the bytes
+    /// the CPU wrote and its writes show at the address, across the whole
+    /// allocation; a second buffer in it is placed in the same region.
+    #[test]
+    fn warp_private_memory_is_used_in_place_where_it_is() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        if windows::core::Interface::cast::<ID3D12Device13>(&device).is_err() {
+            return;
+        }
+        const K: usize = 64 << 10;
+        // SAFETY (the whole test): the placeholder and memory made here.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 4 * K, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0)
+                .cast::<u8>();
+            assert!(!hole.is_null());
+            let at = mem::VirtualAlloc2(process, hole.cast(), 4 * K, mem::MEM_RESERVE | mem::MEM_COMMIT | mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(at, hole.cast(), "{}", std::io::Error::last_os_error());
+            let base = hole as u64;
+            let (start, len) = (base + K as u64 + 0x40, 2 * K as u64);
+            for (i, b) in std::slice::from_raw_parts_mut(start as *mut u8, len as usize).iter_mut().enumerate() {
+                *b = (i * 5 + 1) as u8;
+            }
+            let placed = place_in(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(placed.bias, 0x40);
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(got == std::slice::from_raw_parts(start as *const u8, len as usize), "the card reads the CPU's bytes in place");
+            rig.store(&placed.buffer, placed.bias + K as u64, &[0x6b; 256]).unwrap();
+            assert!(std::slice::from_raw_parts((start + K as u64) as *const u8, 256).iter().all(|&b| b == 0x6b), "the card's write is at the address");
+            let regions = REGIONS.lock().unwrap().len();
+            let second = place_in(&device, base + 3 * K as u64, 100).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(REGIONS.lock().unwrap().len(), regions, "one region for the allocation");
+            drop((placed, second));
+            forget(base as usize, 4 * K);
+            assert!(mem::VirtualFree(hole.cast(), 4 * K, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER) != 0);
+            assert!(mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE) != 0);
+        }
+    }
+
     /// A stretch of a reserved section, mapped as `xmem` maps physical
     /// pages (views of consecutive pages in turn, committed), is opened
     /// through a view of ours: the card reads the bytes the title's views
@@ -375,6 +492,20 @@ mod tests {
             }
             let base = hole as u64;
             let (start, len) = (base + K as u64 + 0x40, 5 * K as u64);
+            if !sections_seen(&device) {
+                // Under Proton (vkd3d-proton on RADV) the card does not see a
+                // section's pages in place: the port turns the buffer down and
+                // the caller copies it as before (no black screen).
+                assert!(matches!(place_in(&device, start, len), Err((5, _))), "refused where sections are not seen");
+                for view in views {
+                    mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER);
+                }
+                crate::inplace::views_gone(base as usize, 8 * K);
+                mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+                mem::VirtualFree(hole.add(3 * K).cast(), 0, mem::MEM_RELEASE);
+                windows_sys::Win32::Foundation::CloseHandle(section);
+                return;
+            }
             let placed = place_in(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
             assert_eq!(placed.bias, 0x40);
             let mut rig = crate::inplace::Rig::new(&device).unwrap();
@@ -401,77 +532,5 @@ mod tests {
             mem::VirtualFree(hole.add(3 * K).cast(), 0, mem::MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-    }
-}
-
-/// Private memory that `xmem` gave pages of the 32-bit heap under Wine
-/// (`port_private`): base and bytes, adjacent pieces joined.
-static PRIVATE: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
-
-/// `xmem` made `[at, at + len)` private memory for this port (Wine).
-pub fn port_private(at: usize, len: usize) {
-    let mut private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut start, mut end) = (at as u64, (at + len) as u64);
-    // Join with the pieces it touches.
-    let touching: Vec<(u64, u64)> = private.range(..=end).filter(|&(&s, &e)| e >= start && s <= end).map(|(&s, &e)| (s, e)).collect();
-    for (s, e) in touching {
-        private.remove(&s);
-        start = start.min(s);
-        end = end.max(e);
-    }
-    private.insert(start, end);
-}
-
-/// `xmem` gave the private memory of `[at, at + len)` back.
-pub fn port_private_gone(at: usize, len: usize) {
-    let (start, end) = (at as u64, (at + len) as u64);
-    let mut private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
-    let touching: Vec<(u64, u64)> = private.range(..end).filter(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
-    for (s, e) in touching {
-        private.remove(&s);
-        if s < start {
-            private.insert(s, start);
-        }
-        if e > end {
-            private.insert(end, e);
-        }
-    }
-    drop(private);
-    forget(at, len);
-}
-
-/// The joined private piece holding `[at, end)`, if one does.
-fn private_stretch(at: u64, end: u64) -> Option<(u64, u64)> {
-    let private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
-    let (&s, &e) = private.range(..=at).next_back()?;
-    (end <= e).then(|| {
-        let (mut first, mut last) = (s, e);
-        if first < LOW && last > LOW {
-            last = LOW;
-        }
-        if last - first > MOST {
-            first = at;
-            last = end;
-        }
-        (first, last - first)
-    })
-}
-
-/// [`open_region`] for private memory: the heap opened on the title's own
-/// pages (anonymous memory, as the driver under vkd3d-proton needs).
-fn open_private(device: &ID3D12Device, first: u64, bytes: u64) -> Result<Region, (usize, String)> {
-    if !committed(first as usize, bytes as usize) {
-        return Err((4, "pages of the private stretch are not committed".to_owned()));
-    }
-    match crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)) {
-        Ok(heap) => {
-            tracing::info!(
-                start = format_args!("{first:#x}"),
-                bytes,
-                "renderer port 1: a stretch of the title's graphics memory opened as a host heap on its own private pages (Wine)"
-            );
-            Ok(Region { start: first, end: first + bytes, heap })
-        }
-        Err(e) => Err((5, format!("refused by the host (private pages): {e}"))),
     }
 }

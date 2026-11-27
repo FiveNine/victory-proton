@@ -204,12 +204,25 @@ impl Detached {
         &self.host
     }
 
-    /// Releases this list's dynamic descriptor slots once its GPU submission
-    /// has completed, without waiting for the full `bury_lag` (64 submissions)
-    /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
+    /// Its submission has run (its flight landed): its dynamic descriptor
+    /// slots go back now, not when it is dropped [`crate::host`]'s bury lag
+    /// later (64 submissions, about two frames). (Belobug/VIctory-Belobug-AMD
+    /// e9428969, beloooo: "preventing dynamic slot exhaustion at ~10k
+    /// draws/frame"; `VICTORY_EARLY_TABLES=0`: at the drop, as before.) In a
+    /// scene of 11,800 draws a frame the 852,000 slots ran out with the lag:
+    /// 2,757 tables a frame refused, the search for room seconds long, 1.3
+    /// fps (session 7900-play, 2026-11-27).
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        if early_tables() {
+            self._state.tables_done();
+        }
     }
+}
+
+/// [`Detached::release_tables`]'s switch (on unless `VICTORY_EARLY_TABLES=0`).
+#[cfg(windows)]
+fn early_tables() -> bool {
+    crate::toggled!("VICTORY_EARLY_TABLES")
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -1551,6 +1564,25 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// Diagnostics: the title's pipeline syncs since the last frame line, by
+/// shape (flags, control, whether for all memory), for [`sync_line`].
+#[cfg(all(windows, feature = "diagnostics"))]
+static SYNC_SHAPES: std::sync::Mutex<Option<std::collections::HashMap<(u32, u32, bool), u64>>> = std::sync::Mutex::new(None);
+
+/// With the frame line: the title's pipeline syncs per frame over `frames`,
+/// by shape (each one a wait for every earlier shader write here).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn sync_line(frames: f64) {
+    let Some(by) = SYNC_SHAPES.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let mut by: Vec<_> = by.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let shapes: Vec<String> = by
+        .iter()
+        .map(|((flags, control, all), n)| format!("{:.1} flags {flags:#x} control {control:#x}{}", *n as f64 / frames, if *all { "" } else { " ranged" }))
+        .collect();
+    tracing::info!("the title's pipeline syncs per frame, by shape: {}", shapes.join("; "));
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. The host orders
 /// nothing between dispatches by itself: what shaders wrote is waited for
@@ -1581,6 +1613,9 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                     );
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+                drop(seen);
+                let mut by = SYNC_SHAPES.lock().unwrap_or_else(|e| e.into_inner());
+                *by.get_or_insert_with(std::collections::HashMap::new).entry(shape).or_default() += 1;
             }
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
@@ -1873,7 +1908,8 @@ fn count_draw() {
 /// executions.
 static TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// See [`TOTALS`].
+/// See [`TOTALS`] (read by `crate::popwatch`, a diagnostics tool).
+#[cfg(feature = "diagnostics")]
 pub(crate) fn totals() -> [u64; 3] {
     TOTALS.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -2103,6 +2139,48 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
     by
 }
 
+/// Diagnostics: the waits recorded since the last line, by comparison code
+/// (0 to 8; higher ones as 9) and width: how many, how many met when
+/// recorded, and one of them (address, reference, value then).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod wait_kinds {
+    use std::sync::Mutex;
+
+    type Kind = (u64, u64, (u64, u64, u64));
+    static KINDS: Mutex<[Kind; 20]> = Mutex::new([(0, 0, (0, 0, 0)); 20]);
+
+    pub(super) fn note(wait: &super::ValueWait) {
+        let met = wait.met();
+        let mut value = [0u8; 8];
+        let bytes = if wait.wide { 8 } else { 4 };
+        let _ = crate::host::read_into(wait.address as *const u8, &mut value[..bytes]);
+        let mut kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+        let kind = &mut kinds[wait.comparison.min(9) as usize * 2 + usize::from(wait.wide)];
+        kind.0 += 1;
+        kind.1 += u64::from(met);
+        kind.2 = (wait.address, wait.reference, u64::from_le_bytes(value));
+    }
+
+    pub(crate) fn log() {
+        let kinds = std::mem::take(&mut *KINDS.lock().unwrap_or_else(|e| e.into_inner()));
+        let text: Vec<String> = kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.0 > 0)
+            .map(|(i, &(n, met, (address, reference, value)))| {
+                format!(
+                    "comparison {} {}: {n} ({met} met when recorded; one at {address:#x} reference {reference:#x} value {value:#x})",
+                    i / 2,
+                    if i % 2 == 1 { "64-bit" } else { "32-bit" }
+                )
+            })
+            .collect();
+        if !text.is_empty() {
+            tracing::info!("waits for memory values recorded since the last line: {}", text.join("; "));
+        }
+    }
+}
+
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
     let wait = ValueWait {
         address,
@@ -2110,6 +2188,8 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         reference,
         wide,
     };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    wait_kinds::note(&wait);
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
         tracing::info!(
@@ -2157,6 +2237,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
+        group_note(count, _groups);
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
@@ -2175,6 +2256,107 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// Diagnostics (`VICTORY_GROUP_NOTES=1`): what the title's barrier groups
+/// ask for, read as the PC's `D3D12_BARRIER_GROUP` (type, count, barriers):
+/// per kind of barrier its syncs and accesses before and after, counted, for
+/// the frame line ([`group_line`]). Read only where the memory is there.
+#[cfg(all(windows, feature = "diagnostics"))]
+static GROUP_NOTES: std::sync::Mutex<Option<std::collections::HashMap<[u32; 5], u64>>> = std::sync::Mutex::new(None);
+
+/// Diagnostics: the title's barrier group calls since the last frame line,
+/// with no groups (a null pointer) and with groups.
+#[cfg(all(windows, feature = "diagnostics"))]
+/// (And of those with groups, the calls none of whose barriers waits: each
+/// barrier's sync before or after is NONE.)
+static GROUP_CALLS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(super) fn group_note(count: u32, groups: *const u8) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    GROUP_CALLS[usize::from(!groups.is_null())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("VICTORY_GROUP_NOTES").is_some() && !groups.is_null() && TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+        let words: Vec<String> = if !groups.is_null() && crate::texture::committed(groups, 32) {
+            // SAFETY: 32 bytes there (just checked).
+            (0..8).map(|i| format!("{:#x}", unsafe { groups.cast::<u32>().add(i).read_unaligned() })).collect()
+        } else {
+            Vec::new()
+        };
+        tracing::info!(count, groups = ?groups, words = words.join(" "), "a barrier group call");
+    }
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_NOTES").is_some_and(|v| v == "1")) || groups.is_null() || count > 64 {
+        return;
+    }
+    // Global 16 bytes a barrier, texture 64, buffer 40 (the PC's layouts).
+    const SIZE: [usize; 3] = [16, 64, 40];
+    let there = |at: *const u8, len: usize| crate::texture::committed(at, len);
+    let mut seen = Vec::new();
+    if !there(groups, 16 * count as usize) {
+        seen.push([u32::MAX; 5]);
+    } else {
+        for g in 0..count as usize {
+            // SAFETY: inside the title's groups, which are there (above).
+            let (kind, n, items) = unsafe {
+                let at = groups.add(16 * g);
+                (at.cast::<u32>().read_unaligned(), at.add(4).cast::<u32>().read_unaligned(), at.add(8).cast::<*const u8>().read_unaligned())
+            };
+            let Some(&size) = SIZE.get(kind as usize) else {
+                seen.push([kind, n, u32::MAX, 0, 0]);
+                continue;
+            };
+            if n > 256 || items.is_null() || !there(items, size * n as usize) {
+                seen.push([kind, n, u32::MAX - 1, 0, 0]);
+                continue;
+            }
+            for b in 0..n as usize {
+                // SAFETY: inside the group's barriers, which are there.
+                let words: [u32; 4] = unsafe { std::array::from_fn(|w| items.add(size * b + 4 * w).cast::<u32>().read_unaligned()) };
+                seen.push([kind, words[0], words[1], words[2], words[3]]);
+            }
+        }
+    }
+    // A call whose every barrier has nothing before it to wait for (sync
+    // before NONE) or nothing after it that waits (sync after NONE).
+    let unread = seen.iter().any(|k| k[2] >= u32::MAX - 1);
+    let waitless = !unread && !seen.is_empty() && seen.iter().all(|k| k[1] == 0 || k[2] == 0);
+    GROUP_CALLS[2].fetch_add(u64::from(waitless), std::sync::atomic::Ordering::Relaxed);
+    let mut notes = GROUP_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    let notes = notes.get_or_insert_with(std::collections::HashMap::new);
+    for k in seen {
+        *notes.entry(k).or_default() += 1;
+    }
+}
+
+/// With the frame line: the kinds of barrier the title's groups asked for
+/// per frame over `frames` (`VICTORY_GROUP_NOTES=1`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn group_line(frames: f64) {
+    let [none, some, waitless] = [0, 1, 2].map(|i| GROUP_CALLS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if none + some > 0 {
+        tracing::info!(
+            "the title's barrier group calls per frame: {:.1} with no groups (a null pointer), {:.1} with groups, {:.1} of them with no barrier that waits (sync before or after NONE); the waits counter now {} ({} frames here)",
+            none as f64 / frames,
+            some as f64 / frames,
+            waitless as f64 / frames,
+            crate::copystat::peek(crate::copystat::C::WaitsForGroups),
+            frames
+        );
+    }
+    let Some(notes) = GROUP_NOTES.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let mut by: Vec<([u32; 5], u64)> = notes.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let kinds = ["global", "texture", "buffer"];
+    let top: Vec<String> = by
+        .iter()
+        .take(12)
+        .map(|(k, n)| {
+            let kind = kinds.get(k[0] as usize).copied().unwrap_or("?");
+            format!("{:.1} {kind} sync {:#x}->{:#x} access {:#x}->{:#x}", *n as f64 / frames, k[1], k[2], k[3], k[4])
+        })
+        .collect();
+    tracing::info!("the title's barrier groups per frame, by barrier (as the PC lays them out): {}", top.join("; "));
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

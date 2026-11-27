@@ -227,16 +227,20 @@ extern "system" fn create_queue(
     )
 }
 
+/// The staging floor in MiB for `VICTORY_DSTORAGE_STAGING_MB`'s value.
+fn staging_floor_mb(set: Option<&str>) -> u64 {
+    set.map(str::trim).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 /// The title asks for 32 MiB and stops if this fails.
 ///
 /// `VICTORY_DSTORAGE_STAGING_MB=<n>`: at least that much (codec-d/cool_fox
-/// 641835a4, which makes it 256 MiB by default, so multi-MB RPF chunks do
-/// not starve the other cores); unset: what the title asks for.
+/// 641835a4 makes it 256 MiB, so multi-MB RPF chunks do not starve the
+/// other requests); unset: what the title asks for. (256 MiB did not make
+/// the logo video's stutter go, 2026-11-26: its reads are not what waits.)
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let floor = *FLOOR_MB.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_STAGING_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
-    }) << 20;
+    let floor = *FLOOR_MB.get_or_init(|| staging_floor_mb(std::env::var("VICTORY_DSTORAGE_STAGING_MB").ok().as_deref())) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size).max(floor);
@@ -1417,12 +1421,6 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
-        // `VICTORY_BCPACK_ZERO=<n>`: BC<n> streams come out as zeros (to see
-        // what a picture owes to them).
-        Some(_) if std::env::var("VICTORY_BCPACK_ZERO").ok().and_then(|v| v.trim().parse::<u8>().ok()) == Some(bc) => {
-            out.fill(0);
-            Ok(out.len())
-        }
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -1773,6 +1771,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn the_staging_floor_is_the_titles_unless_set() {
+        assert_eq!(staging_floor_mb(None), 0);
+        assert_eq!(staging_floor_mb(Some("")), 0);
+        assert_eq!(staging_floor_mb(Some(" 256 ")), 256);
+        assert_eq!(staging_floor_mb(Some("lots")), 0);
+    }
     use crate::modules::xgameruntime::method;
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {

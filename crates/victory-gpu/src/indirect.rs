@@ -60,7 +60,7 @@ ByteAddressBuffer count_buf : register(t1);
 RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -161,8 +161,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -173,7 +172,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -195,17 +194,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[3], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -247,19 +246,7 @@ fn clamp() -> Option<&'static Clamp> {
         .get_or_init(|| match make() {
             Ok(c) => Some(c),
             Err(e) => {
-                // Loud: the symptom (a black world with working menus) looks
-                // like a dozen other problems. The usual cause is an old
-                // d3dcompiler_47.dll (6.3.9600, Windows 8.1) that does not
-                // know cs_5_1 (issue #1 of FiveNine/victory-proton, K53N0).
-                tracing::error!(
-                    error = %e,
-                    "no argument clamp: EVERY indirect draw and dispatch will be dropped and the world will render black; \
-                     d3dcompiler_47.dll must be a Windows 10 SDK one (10.0.x), the Windows 8.1 one (6.3.9600) has no cs_5_1"
-                );
-                eprintln!(
-                    "VIctory: the indirect argument clamp could not be compiled ({e}): every indirect draw is dropped \
-                     and the world will render black. Use a Windows 10 SDK d3dcompiler_47.dll (10.0.x)."
-                );
+                tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
                 None
             }
         })
@@ -351,11 +338,15 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // The blob is not handed to `CreateRootSignature`: under Wine the host
+    // refuses the signature inside it (E_FAIL), while a description read
+    // from the source's `RS` and serialized here works, as the title's own
+    // signatures do.
+    let root = crate::rootstring::make(device, source)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -405,31 +396,15 @@ fn validate_layout(
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
 /// available.
-/// Which step left an indirect execution unbounded (the layout, the clamp,
-/// the budget, the scratch buffer or the recording), said 60 times in all:
-/// the drop reason alone covers all five (K53N0's patch, issue #1).
-fn why_not(step: &'static str) -> Option<ID3D12Resource> {
-    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
-        tracing::warn!(step, "indirect execution not bounded");
-    }
-    None
-}
-
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let Some(bytes) = validate_layout(spec, src.1, count.map(|(_, off)| off)) else { return why_not("layout") };
-    let Some(c) = clamp() else { return why_not("clamp") };
-    let Some(budget) = list.budget() else { return why_not("budget") };
-    let Some(dst) = list.indirect_scratch(bytes) else { return why_not("scratch") };
-    if !clamp_into(list, c, &dst, budget, src, count, spec, false) {
-        return why_not("record");
-    }
-    Some(dst)
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -447,14 +422,9 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let Some(bytes) = validate_layout(spec, src.1, None) else { return why_not("layout") };
-    let Some(c) = clamp() else { return why_not("clamp") };
-    let Some(budget) = list.budget() else { return why_not("budget") };
-    let Some(dst) = list.indirect_scratch(bytes) else { return why_not("scratch") };
-    if !clamp_into(list, c, &dst, budget, src, None, spec, true) {
-        return why_not("record");
-    }
-    Some(dst)
+    let bytes = validate_layout(spec, src.1, None)?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -505,10 +475,6 @@ fn record_clamp_as(
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-            tracing::warn!(src_base, dst_gpu, budget, src_offset, stride, records, kind, "clamp addresses not 4-byte aligned");
-        }
         return false;
     }
     let (src_gpu, args_offset) = match src_offset
@@ -650,6 +616,86 @@ pub(crate) fn open_batch(
 #[cfg(feature = "diagnostics")]
 pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     make_from(device, batch::SOURCE).map(|c| (c.root, c.pso))
+}
+
+/// The check of an execution's record (`VICTORY_ORDER_CHECK`): the record
+/// clamped ahead (`a`) against the one clamped right before the execution
+/// (`b`), `words` long; counted in the budget buffer's words 5 (another) and
+/// 6 (checked), which the list's notes take after it has run.
+#[cfg(feature = "diagnostics")]
+const COMPARE: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Check : register(b0) {
+    uint words;
+};
+ByteAddressBuffer ahead : register(t0);
+ByteAddressBuffer now : register(t1);
+RWStructuredBuffer<uint> notes : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint other = 0;
+    for (uint i = 0; i < words; i++) {
+        if (ahead.Load(i * 4) != now.Load(i * 4)) {
+            other = 1;
+        }
+    }
+    uint was;
+    InterlockedAdd(notes[6], 1, was);
+    if (other != 0) {
+        InterlockedAdd(notes[5], 1, was);
+    }
+}
+"#;
+
+/// Diagnostics (`VICTORY_ORDER_CHECK=1`): whether the record of `kind`
+/// at `src` that a batch clamped ahead into `ahead` (scratch buffer, offset)
+/// is the one a clamp right before its execution makes (into the list's
+/// single-record scratch, which the caller must not be reading from): the
+/// fresh clamp waits for every earlier shader write as
+/// [`bound`] does, the compare after it is counted in the list's budget
+/// notes. Replaces the list's compute root signature and pipeline. False if
+/// it could not be recorded.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn compare(
+    list: &HostList,
+    (ahead, at): (&ID3D12Resource, u64),
+    src: (&ID3D12Resource, u64),
+    (kind, stride): (u32, u32),
+) -> bool {
+    static CHECK: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    let Some(c) = CHECK
+        .get_or_init(|| {
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, COMPARE));
+            made.inspect_err(|e| tracing::warn!(error = %e, "no record check")).ok()
+        })
+        .as_ref()
+    else {
+        return false;
+    };
+    let Some(words) = batch::words(kind) else {
+        return false;
+    };
+    let (Some(budget), Some(now)) = (list.budget(), bound(list, src, None, (kind, stride, 1))) else {
+        return false;
+    };
+    // SAFETY: an open list; our root signature and pipeline; live buffers.
+    // Both records are there: the batch's pass ran before, and `bound` ends
+    // with a wait for every shader write (its own clamp's too). They are
+    // read in the argument state (read only; vkd3d-proton gives root views
+    // the buffer's address); the notes are written before the list's end
+    // copies them.
+    unsafe {
+        let l = &list.list;
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstant(0, words, 0);
+        l.SetComputeRootShaderResourceView(1, ahead.GetGPUVirtualAddress() + at);
+        l.SetComputeRootShaderResourceView(2, now.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(3, budget);
+        l.Dispatch(1, 1, 1);
+    }
+    true
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {

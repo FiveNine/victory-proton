@@ -198,6 +198,17 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
+/// Before the runtime gives up title memory the card may read or write in
+/// place (renderer port 1's private pages under Wine, after
+/// [`title_memory_freeing`]): what the title submitted so far goes to the
+/// card, and everything in the air is settled, so that nothing still to run
+/// there names it once it is gone. From the title's own calls only: not on
+/// a thread of ours inside a submission.
+pub fn title_memory_quiesce() {
+    crate::queue::before_sync();
+    crate::host::settle_everything();
+}
+
 /// The line of what is in place, every ten seconds while [`level`] is on.
 fn say() {
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -646,7 +657,6 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    crate::vqstat::hit(17);
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
     n != 0
         && info.State == mem::MEM_COMMIT
@@ -699,7 +709,7 @@ impl Rig {
     }
 
     /// Records with `record`, runs it and waits (ten seconds at most).
-    fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
+    pub(crate) fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
         // SAFETY: our own list and queue, one run at a time.
         unsafe {
             self.allocator.Reset()?;
@@ -763,12 +773,15 @@ impl Rig {
         const SOURCE: &str = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() { b.Store(8, b.Load(0) + b.Load(4)); }\n";
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; then the
-        // blob's own bytes, which hold the root signature too.
+        // blob's own bytes.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
             D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("inplace"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)?;
             let code = code.ok_or_else(windows::core::Error::empty)?;
+            // Not the blob: under Wine the host refuses the signature inside
+            // it (E_FAIL), while a description read from the source's `RS`
+            // and serialized here works, as the title's own signatures do.
+            let root = crate::rootstring::make(&self.device, SOURCE)?;
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
@@ -938,7 +951,6 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
                 let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x5a).collect();
                 let copied = rig.store(buffer, 4096, &new).is_ok() && same(memory.add(4096), &new);
                 let (mut found, mut count, mut granularity) = ([0usize; 64], 64usize, 0u32);
-                crate::vqstat::hit(18);
                 let watched = mem::GetWriteWatch(0, base.cast(), SIZE, found.as_mut_ptr().cast(), &mut count, &mut granularity) == 0;
                 memory.cast::<[u32; 3]>().write([40, 2, 0]);
                 let shaded = rig.shade(buffer.GetGPUVirtualAddress());
@@ -954,7 +966,6 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
             }
             // What the title can still do with the pages while the heap stands.
             let mut old = 0;
-            crate::vqstat::hit(19);
             let protect_in = mem::VirtualProtect(at.add(8 * K64).cast(), K64, mem::PAGE_READONLY, &mut old) != 0;
             if protect_in {
                 mem::VirtualProtect(at.add(8 * K64).cast(), K64, mem::PAGE_READWRITE, &mut old);
@@ -974,6 +985,9 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
 }
 
 /// A section and a view of it in a placeholder, as `xmem` maps physical
+/// Under Wine: why the probe leaves sections in place out ([`section`]).
+pub(crate) const SECTIONS_NOT_TRIED: &str = "a committed section in place: not tried under Wine (vkd3d-proton on RADV: the card does not see its pages, and a submission that uses it is rejected, which loses the device)";
+
 /// pages: reserved (as it is made today) and committed.
 unsafe fn section(p: &mut Probe, rig: &mut Rig) {
     const SIZE: usize = 32 * K64;
@@ -989,6 +1003,15 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
             p.lines.push(format!("a section made reserved, as the page pool is today (OpenExistingHeapFromFileMapping): {}", hr(&opened)));
             drop(opened);
             windows_sys::Win32::Foundation::CloseHandle(reserved);
+        }
+        // Under Wine (vkd3d-proton on RADV) a heap opens on a committed
+        // section without error, but the card does not see its pages, and a
+        // submission that uses it is rejected by the kernel, which loses the
+        // device (run play-lost: the device went at the first such copy, and
+        // parallel GPU tests that shared it crashed): not tried there.
+        if crate::shadow::on_wine() {
+            p.lines.push(SECTIONS_NOT_TRIED.to_owned());
+            return;
         }
         let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
         let hole = mem::VirtualAlloc2(process, std::ptr::null(), SIZE, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
@@ -1015,7 +1038,6 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
                 p.section_writes = rig.store(buffer, 0, &new).is_ok() && same(memory, &new);
                 // The guard of `watch.rs`: the view read-only.
                 let mut old = 0;
-                crate::vqstat::hit(20);
                 let guarded = mem::VirtualProtect(memory.cast(), K64, mem::PAGE_READONLY, &mut old) != 0;
                 let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x44).collect();
                 let through = rig.store(buffer, 0, &new).is_ok() && same(memory, &new);
@@ -1075,7 +1097,12 @@ unsafe fn cost(p: &mut Probe, rig: &mut Rig, memory: &dyn Fn() -> Option<[u64; 4
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
         let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, (bytes as u64 >> 32) as u32, bytes as u32, std::ptr::null());
+        // (Not under Wine, as in `section`.)
+        let handle = if crate::shadow::on_wine() {
+            std::ptr::null_mut()
+        } else {
+            mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, (bytes as u64 >> 32) as u32, bytes as u32, std::ptr::null())
+        };
         if !handle.is_null() {
             let (set, account, started) = (working_set_mb(), shared(), std::time::Instant::now());
             let opened = open(&rig.device, From::Section(handle as usize));
@@ -1147,7 +1174,6 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    crate::vqstat::hit(21);
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
     if n == 0 {
         return 5;
@@ -1425,18 +1451,29 @@ pub(crate) mod tests {
         }
     }
 
+    /// The software adapter; where there is none (Wine and Proton have no
+    /// WARP) and `VICTORY_TEST_ANY_ADAPTER=1`, the first adapter, so that
+    /// these tests run on the card instead of passing without running.
     pub(crate) fn warp() -> Option<ID3D12Device> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
+        let any = std::env::var_os("VICTORY_TEST_ANY_ADAPTER").is_some_and(|v| v == "1");
         // SAFETY: plain DXGI queries and device creation on the software
-        // adapter; a card is never opened.
+        // adapter, or with the switch on the first adapter.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-            let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                return None;
-            }
+            let software = factory.EnumWarpAdapter::<IDXGIAdapter>().ok().filter(|adapter| {
+                adapter
+                    .cast::<IDXGIAdapter1>()
+                    .ok()
+                    .and_then(|a| a.GetDesc1().ok())
+                    .is_some_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+            });
+            let adapter: IDXGIAdapter = match software {
+                Some(adapter) => adapter,
+                None if any => factory.EnumAdapters(0).ok()?,
+                None => return None,
+            };
             let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
             device
@@ -1460,9 +1497,29 @@ pub(crate) mod tests {
         }
         assert!(probe.part_reads, "the GPU reads private memory in place");
         assert!(probe.part_writes, "GPU writes land in private memory");
+        assert!(probe.reserved_section_refused, "a reserved section is refused");
+        // On a card (`VICTORY_TEST_ANY_ADAPTER=1` where there is no WARP) a
+        // section is what its driver makes of it: under Proton the card does
+        // not see the view's pages, and renderer port 1 stays off there.
+        if !software(&device) {
+            return;
+        }
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
         assert!(probe.section_outlives_views, "the section's heap does not depend on views");
-        assert!(probe.reserved_section_refused, "a reserved section is refused");
+    }
+
+    /// Whether `device` is on the software adapter.
+    pub(crate) fn software(device: &ID3D12Device) -> bool {
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
+            factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+                .ok()
+                .and_then(|a| a.GetDesc1().ok())
+                .is_some_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        }
     }
 
     /// Stage 1's own call on the software adapter: a title buffer that

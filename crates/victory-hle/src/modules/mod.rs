@@ -31,6 +31,8 @@ pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+#[cfg(windows)]
+pub mod tick_clock;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;

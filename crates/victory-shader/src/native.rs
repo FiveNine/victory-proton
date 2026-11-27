@@ -480,6 +480,38 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         u8 resource kind (DXIL's), u8 0, u32 register
 ///   0x43  the shader hash (16 B); the last record
 /// ```
+/// An `FSPX` blob ([`fspx_program`]) from its four entries as a title hands
+/// them to device method 0x218 one by one: the pipeline registers (kind 0),
+/// the pipeline metadata (kind 1), the code (kind 6) and the program
+/// metadata (kind 7).
+pub fn fspx_from_parts(registers: &[u8], pipeline: &[u8], code: &[u8], program: &[u8]) -> Vec<u8> {
+    let parts = [(FSPX_PACKET, registers), (1, pipeline), (FSPX_CODE, code), (FSPX_METADATA, program)];
+    let mut offset = FSPX_HEADER + 16 * parts.len();
+    let total = offset + parts.iter().map(|(_, d)| d.len().next_multiple_of(4)).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"FSPX");
+    for word in [FSPX_VERSION, parts.len() as u32, total as u32] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for (kind, data) in parts {
+        for word in [kind, offset as u32, data.len() as u32, 0] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        offset += data.len().next_multiple_of(4);
+    }
+    for (_, data) in parts {
+        out.extend_from_slice(data);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    out
+}
+
+/// A container whose one `ACCC` part is that `FSPX` blob, as the FidelityFX
+/// shaders come ([`fspx_from_parts`]).
+pub fn fspx_container(registers: &[u8], pipeline: &[u8], code: &[u8], program: &[u8]) -> Vec<u8> {
+    crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx_from_parts(registers, pipeline, code, program))])
+}
+
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if u32_at(part, 4)? != FSPX_VERSION {
         return Err(Malformed("unknown FSPX version"));
@@ -546,6 +578,21 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
+            // Root constants (a CBV the user SGPRs hold, seen at b502):
+            // their SGPRs are counted once all parameters are known.
+            RootType::Constants => {
+                if !layout.iter().any(|p| p.slot == u.slot) {
+                    layout.push(RootParam {
+                        root,
+                        table_offset_dwords: 0,
+                        sgprs: 0,
+                        base_register: u.lower_bound,
+                        user_data: u.user_data,
+                        slot: u.slot,
+                    });
+                }
+                continue;
+            }
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
@@ -559,6 +606,17 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             });
         }
         used.push(u);
+    }
+    // Root constants hold the user SGPRs up to the next parameter's, or to
+    // the last user SGPR (`COMPUTE_PGM_RSRC2` bits 1-5).
+    let user_sgprs = (u32_at(packet, PACKET_RSRC2)? >> 1 & 0x1F) as u8;
+    let starts: Vec<u8> = layout.iter().map(|p| p.user_data).collect();
+    for p in layout.iter_mut().filter(|p| p.root == RootType::Constants) {
+        let end = starts.iter().copied().filter(|&s| s > p.user_data).min().unwrap_or(user_sgprs);
+        if end <= p.user_data {
+            return Err(Malformed("FSPX root constants past the user SGPRs"));
+        }
+        p.sgprs = u32::from(end - p.user_data);
     }
     Ok(NativeProgram {
         stage: HwStage::Cs,
@@ -869,6 +927,79 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A program as method 0x218 hands it over, in four pieces: rebuilt into
+    /// an `FSPX` blob it reads as the FidelityFX ones (thread group, wave
+    /// size, registers, the resource it reads).
+    #[test]
+    fn an_fspx_program_is_rebuilt_from_its_four_pieces() {
+        let mut registers = [0u8; 0x1c];
+        registers[0x0c..0x12].copy_from_slice(&[8, 0, 8, 0, 1, 0]);
+        registers[0x12..0x14].copy_from_slice(&PACKET_WAVE32.to_le_bytes());
+        registers[0x14..0x18].copy_from_slice(&0x402c_0343u32.to_le_bytes());
+        registers[0x18..0x1c].copy_from_slice(&0xb8au32.to_le_bytes());
+        let pipeline = [0u8; 0x14];
+        let code = 0xbf81_0000u32.to_le_bytes(); // s_endpgm
+        let mut program = Vec::new();
+        for w in [0x403u32, 0, 1, 0, 0] {
+            program.extend_from_slice(&w.to_le_bytes());
+        }
+        program.extend_from_slice(&[0x40, 4, 1, 0]);
+        // A UAV in a descriptor table at user data 4, root slot 2, u3.
+        let mut used = [0u8; FSPX_RECORD];
+        used[0] = 0x41;
+        used[4] = 3;
+        used[5] = 3;
+        used[12] = 3;
+        used[16] = 4;
+        used[20] = 8;
+        used[21] = 4;
+        used[22] = 2;
+        program.extend_from_slice(&used);
+        let mut hash = [0u8; FSPX_RECORD];
+        hash[0] = 0x43;
+        program.extend_from_slice(&hash);
+        let size = program.len() as u32 - 0x14;
+        program[4..8].copy_from_slice(&size.to_le_bytes());
+
+        let blob = fspx_from_parts(&registers, &pipeline, &code, &program);
+        let p = fspx_program(&blob).unwrap();
+        assert_eq!(p.stage, HwStage::Cs);
+        assert!(!p.wave64);
+        assert_eq!(p.code, code);
+        let StageIo::Cs(cs) = &p.io else { panic!("{:?}", p.io) };
+        assert_eq!((cs.threads, cs.rsrc2), ([8, 8, 1], 0xb8a));
+        assert_eq!(p.used.len(), 1);
+        assert_eq!((p.used[0].kind, p.used[0].root, p.used[0].lower_bound), (ResourceType::Uav, RootType::Table, 3));
+        assert_eq!((p.layout[0].user_data, p.layout[0].slot), (4, 2));
+        // And in a container, as a title's compute pipeline brings it.
+        let container = fspx_container(&registers, &pipeline, &code, &program);
+        let c = crate::Container::parse(&container).unwrap();
+        assert_eq!(native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap().len(), 1);
+    }
+
+    /// `VICTORY_218_DUMPS=<folder>` (`VICTORY_UNKNOWN_PIPELINE_DIR`'s dumps of
+    /// method 0x218): every one rebuilds into a program that translates.
+    #[test]
+    #[ignore = "needs a title's dumps"]
+    fn the_dumped_0x218_programs_translate() {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_218_DUMPS").expect("VICTORY_218_DUMPS"));
+        let mut ok = 0;
+        let mut failed = Vec::new();
+        for call in 1..=64 {
+            let piece = |word: u32| std::fs::read(dir.join(format!("218-{call}-{word:02}.bin")));
+            let (Ok(registers), Ok(pipeline), Ok(code), Ok(program)) = (piece(1), piece(3), piece(5), piece(7)) else {
+                continue;
+            };
+            let container = fspx_container(&registers, &pipeline, &code, &program);
+            match crate::emit::translate(&container) {
+                Ok(_) => ok += 1,
+                Err(e) => failed.push(format!("{call}: {e}")),
+            }
+        }
+        eprintln!("{ok} translate; {} do not: {failed:#?}", failed.len());
+        assert!(ok > 0 && failed.is_empty());
+    }
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];

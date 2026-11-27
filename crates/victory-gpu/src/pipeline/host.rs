@@ -379,6 +379,11 @@ impl Stage {
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
+    /// Lays premultiplied colour over an RGBA8 target (blend ONE,
+    /// INV_SRC_ALPHA, add): a title's UI layer put over its finished frame
+    /// (frame generation's HUD-less colour is the target before it).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) over: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
@@ -527,7 +532,6 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_FAULTS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
-                            || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
@@ -634,15 +638,11 @@ impl HostPipeline {
                     return None;
                 }
             };
-            // vkd3d-proton's name for the shader's dumps (FNV-1 64 of the
-            // DXIL, `VKD3D_SHADER_DUMP_PATH`), to find them.
-            let dumped = stages.first().and_then(|(s, _)| s.translated()).map_or(0, |t| {
-                t.host.dxil.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| h.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(b))
-            });
-            tracing::info!(?shaders, vkd3d = format_args!("{dumped:016x}"), "host pipeline");
+            tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
+                over: false,
                 mesh: false,
                 pso,
                 root,
@@ -696,6 +696,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
+                over: false,
                 mesh: true,
                 pso,
                 root,
@@ -812,6 +813,15 @@ impl HostPipeline {
         );
         Some(HostPipeline {
             compute: false,
+            over: {
+                let b = &g.blend.RenderTarget[0];
+                g.targets.NumRenderTargets == 1
+                    && g.targets.RTFormats[0] == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
+                    && b.BlendEnable.as_bool()
+                    && b.SrcBlend == D3D12_BLEND_ONE
+                    && b.DestBlend == D3D12_BLEND_INV_SRC_ALPHA
+                    && b.BlendOp == D3D12_BLEND_OP_ADD
+            },
             mesh: false,
             pso,
             root,

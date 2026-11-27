@@ -69,7 +69,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, RAY_PROBE_DWORDS};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -99,13 +99,6 @@ const AGAIN: u64 = 8;
 /// From a root view; from one that is written (a structure being built).
 const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
-
-/// What is readied from a view the builder writes (a structure being
-/// built): [`BUILT`], or `VICTORY_BUILT_MB`.
-fn built() -> u64 {
-    static SET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SET.get_or_init(|| std::env::var("VICTORY_BUILT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(BUILT, |mb| mb << 20))
-}
 /// The biggest title buffer whose builder results come back.
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
@@ -114,92 +107,18 @@ const BACK: u64 = 256 << 10;
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 
-/// Pages taken from the faults that are held at a time, at most: past it the
-/// oldest of them is given back (it comes again if a shader still reads it).
-/// With [`FAULTS_ALL`] alone the builder found 240-600 pages a frame empty
-/// for the rest of the run, read zeros there and built structures with
-/// holes: the ray-traced light pulsed from frame to frame (2026-11-27, runs
-/// dense against densefault: frame-to-frame change 1.93 against 0.64, 0.80
-/// without rays), and taking them all filled the 3 GiB in a minute and the
-/// card with it. `VICTORY_FAULT_BUDGET=<pages>` (0: the old cap in all).
-///
-/// Two queues (as 2Q): a page comes on probation (a quarter of the budget);
-/// one that faults again after it was given back from there is kept on the
-/// other queue (the rest). Pages the builder reads once, at addresses that
-/// move from frame to frame, pass through probation without pushing out
-/// those it reads every frame: with one queue of 8,192 pages everything was
-/// given back and taken again (106,000 in 150 s) and the light pulsed more.
-fn fault_budget() -> usize {
-    static SET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SET.get_or_init(|| std::env::var("VICTORY_FAULT_BUDGET").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
-}
-
-/// Pages given back from probation that are remembered, at most.
-const GHOSTS: usize = 1 << 16;
-
-/// Pages that keep faulting: past [`FAULTS_ALL`] a page is still taken once
-/// it has faulted in [`persist`]`.0` frames, up to `.1` such pages. Most
-/// faults are pages a garbage pointer reached once (58,104 pages faulted by
-/// programs that trace rays in 130 s, 8,075 of them in ten frames or more,
-/// run fl); the cap in all went on those in the first seconds, and the
-/// pages rays read every frame (4,533 of them in 0xe_0000_0000 alone, where
-/// 131 were held) read zeros for the rest of the run.
-/// `VICTORY_FAULT_PERSIST=<frames>,<pages>` (0 frames: off).
-fn persist() -> (u32, usize) {
-    static SET: std::sync::OnceLock<(u32, usize)> = std::sync::OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_FAULT_PERSIST").unwrap_or_default();
-        let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
-        (n.next().flatten().unwrap_or(3) as u32, n.next().flatten().unwrap_or(16384))
-    })
-}
-
-/// Whether pages that keep faulting and lie in a window outside buffers get
-/// the window's copy (`VICTORY_FAULT_WINDOWS=1`; off: a window numbered so
-/// is held for the run, and in run fw2 they piled up until the PC's memory
-/// ran out at 140 s, with no better light).
-fn fault_windows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_WINDOWS").is_some_and(|v| v == "1"))
-}
-
-/// Frames a page given back waits before its place holds another: lists
-/// recorded with the old entry may still be on their way.
-const COOL: u64 = 6;
-
-/// Pages taken from the faults in all (`VICTORY_BVH_FAULTS_ALL=<n>`, as
-/// upstream e823263 names it; unset: [`FAULTS_ALL`]).
+/// Pages taken from the faults in all (`VICTORY_BVH_FAULTS_ALL=<n>`; unset:
+/// [`FAULTS_ALL`]). With ray tracing the bound is met in the first minute
+/// (run play-1126-0921: at 63 s), and from then on 130-500 pages a frame that
+/// the walking programs touch have no copy for the rest of the run.
 fn faults_all() -> usize {
-    fault_caps().1
-}
-
-/// [`FAULTS`] and [`FAULTS_ALL`], or `VICTORY_FAULT_CAPS=<a frame>,<in all>`
-/// (`VICTORY_BVH_FAULTS_ALL` for the second as well).
-fn fault_caps() -> (usize, usize) {
-    static SET: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_FAULT_CAPS").unwrap_or_default();
-        let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
-        let all = std::env::var("VICTORY_BVH_FAULTS_ALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL);
-        let caps = (n.next().flatten().unwrap_or(FAULTS), n.next().flatten().unwrap_or(all));
-        if caps != (FAULTS, FAULTS_ALL) {
-            tracing::info!(frame = caps.0, all = caps.1, "title memory by address: pages taken from the faults");
-        }
-        caps
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BVH_FAULTS_ALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
     })
 }
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
-
-/// [`SWEEP`], or `VICTORY_BVH_SWEEP=<frames>`.
-fn sweep() -> usize {
-    static SET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SET.get_or_init(|| {
-        let n = std::env::var("VICTORY_BVH_SWEEP").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(SWEEP);
-        tracing::info!(frames = n, "title memory by address: every held page looked at again over so many frames");
-        n
-    })
-}
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -263,25 +182,6 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
-    /// Those held now, oldest first ([`fault_budget`]): on probation, kept.
-    fault_pages: std::collections::VecDeque<u64>,
-    fault_kept: std::collections::VecDeque<u64>,
-    /// Pages given back from probation, remembered (and in order).
-    ghosts: std::collections::HashSet<u64>,
-    ghost_order: std::collections::VecDeque<u64>,
-    /// Places given back, free from the frame named.
-    cooling: std::collections::VecDeque<(u64, usize, usize)>,
-    /// Pages given back for the budget.
-    evicted: u64,
-    /// Faults (frame, page with marks) for `VICTORY_FAULT_LIST`.
-    fault_log: Vec<(u64, u32)>,
-    /// Pages that faulted: the frames they did in, and the last.
-    fault_seen: HashMap<u64, (u32, u64)>,
-    /// Pages taken for faulting in several frames.
-    persisted: usize,
-    /// Structures whose compacted size the builder was asked for: where the
-    /// size goes ([`Memory::size_of_copy`]).
-    size_slots: HashMap<u64, u64>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -289,9 +189,6 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
-    /// `VICTORY_RAY_PROBE=1`: the probe's counters as last read (they only
-    /// grow; the GPU adds to them while they are read).
-    probe_seen: [u32; RAY_PROBE_DWORDS as usize],
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -317,30 +214,10 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
-    /// Faults by what found them: loads, loads of programs that trace rays,
-    /// stores, stores of such programs.
-    kinds: [u64; 4],
-    /// Faults on pages a window outside buffers holds already.
-    in_window: u64,
-    /// Copies of structures over 4 MiB readied whole.
-    copies_sized: u64,
-    /// Microseconds of the once-a-frame work, and of its sweep.
-    frame_us: u64,
-    sweep_us: u64,
-    sweep_pages_us: u64,
-    /// The mutex: calls, microseconds waited for it, held.
-    lock_calls: u64,
-    lock_wait: u64,
-    lock_held: u64,
-    /// Pages that keep faulting given a window's copy.
-    from_windows: u64,
-    /// `VICTORY_BVH_HEADERS=1`: structure headers named for programs that
-    /// pick structures by a computed index, those of them whose page had no
-    /// copy then, and the pages that came for them.
-    headers: [u64; 3],
-    /// `VICTORY_RAY_PROBE=1`: the probe's counters summed since the last
-    /// report ([`victory_shader::emit::RAY_PROBE_DWORDS`]).
-    probe: [u64; RAY_PROBE_DWORDS as usize],
+    /// Pages found without a copy that were left so because of the bounds on
+    /// pages taken from faults, and the different pages faulted.
+    left: u64,
+    distinct: std::collections::HashSet<u64>,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -365,12 +242,10 @@ impl Memory {
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        // (After the page notes, the ray probe's counters: `VICTORY_RAY_PROBE=1`.)
-        let dwords = MEMORY_FAULTS + RAY_PROBE_DWORDS;
-        let (faults, data) = host.shared_buffer(u64::from(dwords) * 4)?;
+        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, dwords as usize * 4) };
+        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -390,20 +265,9 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
-            fault_pages: std::collections::VecDeque::new(),
-            fault_kept: std::collections::VecDeque::new(),
-            ghosts: std::collections::HashSet::new(),
-            ghost_order: std::collections::VecDeque::new(),
-            cooling: std::collections::VecDeque::new(),
-            evicted: 0,
-            fault_log: Vec::new(),
-            size_slots: HashMap::new(),
-            fault_seen: HashMap::new(),
-            persisted: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
-            probe_seen: [0; RAY_PROBE_DWORDS as usize],
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -588,8 +452,7 @@ impl Memory {
 
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
-        let began = std::time::Instant::now();
-        for _ in 0..self.order.len().div_ceil(sweep()) {
+        for _ in 0..self.order.len().div_ceil(SWEEP) {
             self.sweep = (self.sweep + 1) % self.order.len();
             let page = self.order[self.sweep];
             if self.pages.contains_key(&page) {
@@ -601,8 +464,7 @@ impl Memory {
                 }
             }
         }
-        self.stats.sweep_pages_us += began.elapsed().as_micros() as u64;
-        for _ in 0..self.packed_order.len().div_ceil(sweep()) {
+        for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
             self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
             let address = self.packed_order[self.packed_sweep];
             if !self.packed.contains_key(&address) {
@@ -810,37 +672,14 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
-        if victory_shader::emit::ray_probe() {
-            for (k, seen) in self.probe_seen.iter_mut().enumerate() {
-                // SAFETY: inside the faults' mapping (the counters after the
-                // notes); the GPU may be adding, a count missed now is read
-                // next frame.
-                let now = unsafe { self.faults.1.add(MEMORY_FAULTS as usize + k).read_volatile() };
-                self.stats.probe[k] += u64::from(now.wrapping_sub(*seen));
-                *seen = now;
-            }
-        }
         let mut pages = Vec::new();
-        let mut stores = std::collections::HashSet::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
-            let noted = unsafe { at.read_volatile() };
-            if noted != 0 {
-                // (The shader's marks: a store, a program that traces rays.)
-                self.stats.kinds[(noted >> 30) as usize] += 1;
-                let page = noted & 0x3FFF_FFFF;
-                if noted & 1 << 31 != 0 {
-                    stores.insert(u64::from(page));
-                }
-                if crate::shadow::window_over(u64::from(page) * PAGE, PAGE).is_some() {
-                    self.stats.in_window += 1;
-                }
-                if self.fault_log.len() < 1 << 20 {
-                    self.fault_log.push((self.frame, noted));
-                }
+            let page = unsafe { at.read_volatile() };
+            if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -851,76 +690,20 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
-        let budget = fault_budget();
-        while self.cooling.front().is_some_and(|c| c.0 <= self.frame) {
-            let (_, copy, at) = self.cooling.pop_front().unwrap();
-            self.free.push((copy, at));
-        }
+        let all = faults_all();
         for &page in &pages {
-            let (frame_cap, all_cap) = fault_caps();
-            // A store that found no page was dropped: the structure it wrote
-            // has a hole until it is written again. Those pages are few
-            // (1,628 in 130 s, run fl) and taken past the cap in all.
-            let stored = stores.contains(&page);
-            let (frames, most) = persist();
-            let seen = {
-                if self.fault_seen.len() > 1 << 20 {
-                    self.fault_seen.retain(|_, s| s.0 >= 2);
-                }
-                let frame = self.frame;
-                let e = self.fault_seen.entry(page).or_insert((0, u64::MAX));
-                if e.1 != frame {
-                    *e = (e.0 + 1, frame);
-                }
-                e.0
-            };
-            let persistent = frames > 0 && seen >= frames;
-            let kept = persistent && self.persisted < most;
-            if made >= frame_cap || self.copy_of(page).is_some() {
+            self.stats.distinct.insert(page);
+            if self.copy_of(page).is_some() {
                 continue;
             }
-            // A load of a page a window outside buffers holds already: the
-            // window's copy, read-only, costs nothing more (an arena's page
-            // is memory three times over: ours, its staging, the card's).
-            // Only for pages that keep faulting: the copy is then held for
-            // the run.
-            if !stored
-                && persistent
-                && fault_windows()
-                && self.possible(page)
-                && let Some(window) = crate::shadow::window_over(page * PAGE, PAGE)
-            {
-                let offset = page * PAGE - window.span().0;
-                if let Some(n) = self.number(window) {
-                    close(self.entry(page), n, offset);
+            if made < FAULTS && self.faulted < all {
+                if self.map(page) {
                     made += 1;
-                    self.stats.from_windows += 1;
-                    continue;
+                    self.faulted += 1;
+                    self.bring(page, page + 1);
                 }
-            }
-            if budget == 0 && self.faulted >= all_cap && !stored && !kept {
-                continue;
-            }
-            let past_cap = budget == 0 && self.faulted >= all_cap && !stored;
-            let again = budget > 0 && self.ghosts.remove(&page);
-            if budget > 0 {
-                let probation = (budget / 4).max(1);
-                if again {
-                    while self.fault_kept.len() >= budget - probation && self.give_back_oldest(true) {}
-                } else {
-                    while self.fault_pages.len() >= probation && self.give_back_oldest(false) {}
-                }
-            }
-            if self.map(page) {
-                made += 1;
-                self.faulted += 1;
-                if past_cap {
-                    self.persisted += 1;
-                }
-                if budget > 0 && self.pages.contains_key(&page) {
-                    if again { self.fault_kept.push_back(page) } else { self.fault_pages.push_back(page) }
-                }
-                self.bring(page, page + 1);
+            } else {
+                self.stats.left += 1;
             }
         }
         self.stats.faults += pages.len() as u64;
@@ -957,53 +740,6 @@ impl Memory {
                 "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
             );
         }
-    }
-
-    /// The size of a structure the builder copies (compacts) from `from`: what
-    /// the title read for it from the slot its size was asked into, if that
-    /// is a size over 4 MiB and under 64 MiB. The copy wrote it whole: past
-    /// the 4 MiB readied from a written view its stores were dropped and the
-    /// structure stood cut off. Of 937 structures 17 were over 4 MiB, up to
-    /// 48 MiB, all of them 358 MB (run bt, 2026-11-27).
-    fn size_of_copy(&self, from: u64) -> Option<u64> {
-        if from < 1 << 32 || crate::shadow::in_buffer(from, 1).is_some() {
-            return None;
-        }
-        let slot = *self.size_slots.get(&from)?;
-        let mut b = [0u8; 8];
-        crate::host::copy_mapped(b.as_mut_ptr(), slot as *const u8, 8, false);
-        let len = u64::from_le_bytes(b);
-        (BUILT < len && len <= 64 << 20).then_some(len)
-    }
-
-    /// Gives back the oldest page taken from the faults that nothing else
-    /// holds; false if there is none.
-    fn give_back_oldest(&mut self, kept: bool) -> bool {
-        loop {
-            let Some(page) = (if kept { self.fault_kept.pop_front() } else { self.fault_pages.pop_front() }) else {
-                break;
-            };
-            let Some(held) = self.pages.get(&page) else { continue };
-            if held.owners > 0 {
-                continue;
-            }
-            let (copy, at) = (held.copy, held.at);
-            self.pages.remove(&page);
-            // SAFETY: an entry of the directory, under the mutex.
-            unsafe { self.entry(page).write_volatile(0) };
-            self.cooling.push_back((self.frame + COOL, copy, at));
-            self.evicted += 1;
-            if !kept && self.ghosts.insert(page) {
-                self.ghost_order.push_back(page);
-                while self.ghost_order.len() > GHOSTS {
-                    if let Some(old) = self.ghost_order.pop_front() {
-                        self.ghosts.remove(&old);
-                    }
-                }
-            }
-            return true;
-        }
-        false
     }
 
     /// The structures named in a list's upload memory around `address`
@@ -1064,26 +800,12 @@ impl Memory {
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
-        // `VICTORY_FAULT_LIST=<file>`: the pages held (page, packed owners,
-        // theirs, born) and the faults so far (frame, page with marks).
-        if let Some(file) = std::env::var_os("VICTORY_FAULT_LIST") {
-            let mut text = String::new();
-            for (page, h) in &self.pages {
-                text += &format!("H {page:#x} {} {} {}\n", h.owners, h.theirs as u8, h.born);
-            }
-            for (address, p) in &self.packed {
-                text += &format!("P {address:#x} {}\n", p.len);
-            }
-            for &(frame, noted) in &self.fault_log {
-                text += &format!("F {frame} {noted:#x}\n");
-            }
-            let _ = std::fs::write(file, text);
-        }
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} for faulting in several frames, {} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole; {} pages from windows; the mutex per frame: {:.0} calls, {:.2} ms waited for (all threads), {:.2} ms held, of it {:.2} ms the frame's faults and sweep ({:.2} the sweep, {:.2} of it its pages)",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; \
+             since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all)",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -1106,55 +828,10 @@ impl Memory {
             s.came[2],
             s.came[3],
             self.faulted,
-            self.persisted,
-            self.fault_pages.len() + self.fault_kept.len(),
-            self.evicted,
-            s.kinds[0] as f64 / frames,
-            s.kinds[1] as f64 / frames,
-            s.kinds[2] as f64 / frames,
-            s.kinds[3] as f64 / frames,
-            s.in_window as f64 / frames,
-            s.copies_sized,
-            s.from_windows,
-            s.lock_calls as f64 / frames,
-            s.lock_wait as f64 / 1000.0 / frames,
-            s.lock_held as f64 / 1000.0 / frames,
-            s.frame_us as f64 / 1000.0 / frames,
-            s.sweep_us as f64 / 1000.0 / frames,
-            s.sweep_pages_us as f64 / 1000.0 / frames
+            s.distinct.len(),
+            s.left as f64 / frames,
+            faults_all()
         );
-        if crate::descriptor::host::bvh_headers() {
-            let [named, missing, came] = s.headers;
-            tracing::info!(
-                "title memory by address (VICTORY_BVH_HEADERS): per frame {:.1} structure headers named for programs that pick                  structures by index, {:.1} of them with no copy then ({missing} in all since the last line), {came} pages came for them",
-                named as f64 / frames,
-                missing as f64 / frames,
-            );
-        }
-        if victory_shader::emit::ray_probe() {
-            let p = s.probe;
-            let per = |n: u64| n as f64 / frames;
-            let share = |n: u64, of: u64| if of == 0 { 0.0 } else { 100.0 * n as f64 / of as f64 };
-            tracing::info!(
-                node_tests = p[0],
-                box_nodes = p[5],
-                triangle_tests = p[1],
-                finite_hits = p[2],
-                nan = p[3],
-                infinite = p[6],
-                no_copy = p[4],
-                "ray probe (VICTORY_RAY_PROBE): per frame {:.0} node tests ({:.0} boxes), {:.0} triangle tests, {:.0} finite hits ({:.1}% of                  triangle tests), {:.0} NaN distances, {:.0} infinite (misses), {:.0} node tests on pages with no copy ({:.1}%)",
-                per(p[0]),
-                per(p[5]),
-                per(p[1]),
-                per(p[2]),
-                share(p[2], p[1]),
-                per(p[3]),
-                per(p[6]),
-                per(p[4]),
-                share(p[4], p[0]),
-            );
-        }
         self.stats.from = Some((now, self.frame));
     }
 }
@@ -1215,15 +892,6 @@ fn close(entry: *mut u32, n: usize, offset: u64) {
 
 /// The offset first: a shader that sees the number sees it too.
 fn fill(entry: *mut u32, n: usize, offset: u64) {
-    // The ray-tracing node test reads a node's 16-byte quarters as such
-    // (`victory_shader::emit` `bvh_node_words`): a page on less than 16
-    // bytes in its copy would read the wrong bytes there.
-    if offset % 16 != 0 {
-        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-            tracing::warn!(offset, "a page of title memory lies on less than 16 bytes in its copy");
-        }
-    }
     // SAFETY: an entry of the directory, under the mutex.
     unsafe {
         entry.add(1).write_volatile(offset as u32);
@@ -1275,30 +943,20 @@ pub(crate) fn ready(
     addresses: &[u64],
     written: &[u64],
     constants: &[u32],
-    headers: &[u64],
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
-    let asked = std::time::Instant::now();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    let got = std::time::Instant::now();
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
-    m.stats.lock_wait += (got - asked).as_micros() as u64;
-    m.stats.lock_calls += 1;
-    let _timer = HeldTimer(got, &raw mut m.stats.lock_held);
     let frame = crate::frame::current();
     if m.frame != frame {
-        let began = std::time::Instant::now();
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
-        let swept = std::time::Instant::now();
         m.look_again();
-        m.stats.sweep_us += swept.elapsed().as_micros() as u64;
-        m.stats.frame_us += began.elapsed().as_micros() as u64;
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
@@ -1310,26 +968,6 @@ pub(crate) fn ready(
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
-    }
-    if builds
-        && asks_size(written, constants, threads)
-        && let [lo, hi, 1, ..] = *constants
-        && let Some(&slot) = written.first()
-    {
-        if m.size_slots.len() > 1 << 16 {
-            m.size_slots.clear();
-        }
-        m.size_slots.insert(u64::from(lo) | u64::from(hi) << 32, slot);
-    }
-    if builds
-        && threads == Some([32, 1, 1])
-        && let [from, to] = *written
-        && let Some(len) = m.size_of_copy(from)
-        && list.first_use(usize::MAX - (6 << 33) - (to >> 2 & 0x7FFF_FFFF) as usize)
-    {
-        m.ready(from, len);
-        m.ready(to, len);
-        m.stats.copies_sized += 1;
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
@@ -1407,7 +1045,7 @@ pub(crate) fn ready(
                     (built.1, built.2) = (frame, built.2 + 1);
                 }
                 let before = held(m);
-                m.ready(at, built());
+                m.ready(at, BUILT);
                 came[1] += held(m).saturating_sub(before);
             }
         }
@@ -1426,24 +1064,6 @@ pub(crate) fn ready(
                 came[2] += held(m).saturating_sub(before);
             }
         }
-    }
-    // `VICTORY_BVH_HEADERS=1`: the header page of every structure the heap
-    // holds a view of, for a program that picks them by a computed index
-    // (from DexNom/VIctory 8114ff77 `memory.rs`).
-    for &at in headers.iter().filter(|&&a| a >= 1 << 32) {
-        if !named(7, at) {
-            continue;
-        }
-        m.stats.headers[0] += 1;
-        if m.copy_of(at / PAGE).is_none() {
-            m.stats.headers[1] += 1;
-        }
-        let before = held(m);
-        match crate::shadow::in_buffer(at, 1) {
-            Some(_) => m.ready(at, 1),
-            None => m.ready(at, PAGE),
-        }
-        m.stats.headers[2] += held(m).saturating_sub(before);
     }
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
@@ -1491,17 +1111,6 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
-}
-
-/// Adds the time since it was made to the counter it points at, when it
-/// goes (under the memory's mutex, which outlives it).
-struct HeldTimer(std::time::Instant, *mut u64);
-impl Drop for HeldTimer {
-    fn drop(&mut self) {
-        // SAFETY: the counter lives in the memory behind the mutex the
-        // caller still holds.
-        unsafe { *self.1 += self.0.elapsed().as_micros() as u64 };
-    }
 }
 
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of

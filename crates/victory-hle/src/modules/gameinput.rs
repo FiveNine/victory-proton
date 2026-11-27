@@ -80,12 +80,12 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
-/// Opt-in GTA V PC-style keyboard bindings for the stand-in gamepad
-/// (`VICTORY_KBM_GTA=1`). Left stick stays W/A/S/D; right stick is driven by
+/// Opt-in PC-style keyboard bindings for the stand-in gamepad
+/// (`VICTORY_KBM_PC=1`). Left stick stays W/A/S/D; right stick is driven by
 /// mouse look (toggled with F2 or `` ` `` / `~`) plus I/J/K/L fallback;
 /// triggers come from LMB (RT) and RMB (LT). `Host::keys()` reports specific
 /// left/right modifiers (`0xA0..=0xA5`) rather than generic `0x10..=0x12`.
-const GTA_BUTTONS: [(u8, u32); 26] = [
+const PC_BUTTONS: [(u8, u32); 26] = [
     (0x1B, MENU),           // Esc (also unlocks mouse look)
     (b'P', MENU),           // Pause / Map
     (b'V', VIEW),           // Change camera perspective
@@ -114,13 +114,13 @@ const GTA_BUTTONS: [(u8, u32); 26] = [
     (b'G', LEFT),           // G: Throw / Context left (D-pad Left)
 ];
 
-/// Whether GTA mouse-look lock (`~` / `F2`) is currently active; read by
+/// Whether mouse-look lock (`~` / `F2`) is currently active; read by
 /// `lifecycle` on `WM_SETCURSOR` to auto-hide the Windows cursor inside the
 /// game window's client area while locked.
 #[cfg(windows)]
 static CURSOR_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Returns true while GTA mouse-look lock (`~` / `F2`) is active and the
+/// Returns true while mouse-look lock (`~` / `F2`) is active and the
 /// cursor should be hidden inside the client area.
 #[cfg(windows)]
 pub(crate) fn cursor_locked() -> bool {
@@ -136,15 +136,15 @@ fn parse_env_flag(value: &str) -> bool {
     )
 }
 
-/// GTA V PC-style keyboard + mouse stand-in pad (`VICTORY_KBM_GTA=1`).
+/// PC-style keyboard + mouse stand-in pad (`VICTORY_KBM_PC=1`).
 /// Off by default so the existing keyboard table and tests stay unchanged.
-fn gta_kbm() -> bool {
+fn pc_kbm() -> bool {
     static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("VICTORY_KBM_GTA").is_ok_and(|v| parse_env_flag(&v)));
+        LazyLock::new(|| std::env::var("VICTORY_KBM_PC").is_ok_and(|v| parse_env_flag(&v)));
     *ENABLED
 }
 
-/// Mouse-look sensitivity multiplier for `VICTORY_KBM_GTA=1`
+/// Mouse-look sensitivity multiplier for `VICTORY_KBM_PC=1`
 /// (`VICTORY_MOUSE_SENS`, default `1.0`).
 #[cfg(windows)]
 fn mouse_sens() -> f32 {
@@ -158,7 +158,7 @@ fn mouse_sens() -> f32 {
     *SENS
 }
 
-/// Invert mouse Y axis for `VICTORY_KBM_GTA=1` (`VICTORY_MOUSE_INVERT_Y=1`).
+/// Invert mouse Y axis for `VICTORY_KBM_PC=1` (`VICTORY_MOUSE_INVERT_Y=1`).
 #[cfg(windows)]
 fn mouse_invert_y() -> bool {
     static INVERT: LazyLock<bool> =
@@ -279,7 +279,7 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
-    /// Extra stand-in pad input from the mouse when `VICTORY_KBM_GTA=1`.
+    /// Extra stand-in pad input from the mouse when `VICTORY_KBM_PC=1`.
     /// When `active` is false (a physical controller owns input), any active
     /// mouse-look capture must be released without warping the cursor.
     fn mouse_pad(&mut self, _active: bool) -> PadState {
@@ -288,10 +288,10 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    fallback_for(keys, gta_kbm())
+    fallback_for(keys, pc_kbm())
 }
 
-fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
+fn fallback_for(keys: &[KeyState], pc_style: bool) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -299,14 +299,14 @@ fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
             0.0
         }
     };
-    let table: &[(u8, u32)] = if gta { &GTA_BUTTONS } else { &FALLBACK_BUTTONS };
+    let table: &[(u8, u32)] = if pc_style { &PC_BUTTONS } else { &FALLBACK_BUTTONS };
     PadState {
         buttons: table
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: if gta { 0.0 } else { on(b'Z') },
-        right_trigger: if gta { 0.0 } else { on(b'C') },
+        left_trigger: if pc_style { 0.0 } else { on(b'Z') },
+        right_trigger: if pc_style { 0.0 } else { on(b'C') },
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
@@ -1412,6 +1412,18 @@ mod host {
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+                // A scripted run with no pad gets a host pad in slot 0: the
+                // title's account screen does not take the stand-in's A.
+                #[cfg(feature = "diagnostics")]
+                if slot == 0 && std::env::var_os("VICTORY_KEYS").is_some() {
+                    let mut pad = convert(&state.Gamepad);
+                    for vk in scripted() {
+                        if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                            pad.buttons |= button;
+                        }
+                    }
+                    return Some(pad);
+                }
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
                 return None;
             }
@@ -1470,7 +1482,7 @@ mod host {
         }
 
         fn mouse_pad(&mut self, active: bool) -> PadState {
-            if !gta_kbm() || !active {
+            if !pc_kbm() || !active {
                 self.disarm_mouse(foreground_window(), "stand-in inactive");
                 return PadState::default();
             }
@@ -2108,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn gta_kbm_maps_pc_style_keys_and_smooths_mouse_look() {
+    fn pc_kbm_maps_pc_style_keys_and_smooths_mouse_look() {
         let keys = vec![
             key(b'W'),
             key(0xA0), // Left Shift -> A (Sprint)

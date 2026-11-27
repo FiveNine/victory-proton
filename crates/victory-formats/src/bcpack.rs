@@ -1049,6 +1049,16 @@ const BC6_LAYOUT: [&[Run]; 15] = [
     ],
 ];
 
+/// `VICTORY_BC6_REVERSED=1`: modes 13 and 14 write endpoint 0's high bits
+/// highest first, as the public BC6H layout (D3D's `rw[10:11]`,
+/// `rw[10:15]`) and its decoders (DirectXTex, bcdec) read them, instead of
+/// ascending; to compare on screen which one the title's textures are
+/// (the user: water and eyes look wrong, 2026-11-26).
+fn bc6_high_bits_reversed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BC6_REVERSED").is_some_and(|v| v == "1"))
+}
+
 fn bc6_index_bits(mode: u8) -> u8 {
     match mode {
         1..=10 => 3,
@@ -1140,9 +1150,16 @@ fn bc6<'a>(
         let (code, n) = BC6_CODE[usize::from(mode)];
         w.put(code, n);
         let part = s[31] & 31;
+        let reversed = mode >= 13 && bc6_high_bits_reversed();
         for run in BC6_LAYOUT[usize::from(mode)] {
             if run.ch == 3 {
                 w.put(part.into(), 5);
+            } else if reversed && run.ep == 0 && run.first >= 10 {
+                // The public layout: the high bits of endpoint 0, highest first.
+                let value = field(0, run.ch.into());
+                for bit in (run.first..run.first + run.len).rev() {
+                    w.put(value >> bit & 1, 1);
+                }
             } else {
                 w.put(
                     field(run.ep.into(), run.ch.into()) >> run.first,

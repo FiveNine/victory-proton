@@ -24,11 +24,14 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
-#[cfg(windows)]
-mod hooks;
+// (Only the stack dumps' unwinding, a diagnostics tool, runs guarded.)
+#[cfg(all(windows, feature = "diagnostics"))]
+mod guarded;
 #[cfg(windows)]
 pub mod descriptor_sites;
 pub mod frame_rate;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod patch;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
@@ -54,6 +57,8 @@ pub use crash::{
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use patch::CodeWrite;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

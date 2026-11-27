@@ -268,17 +268,27 @@ extern "system" fn check_feature_support(
     data: *mut c_void,
     size: u32,
 ) -> HRESULT {
+    feature_support(feature, data, size, crate::external::host_fidelityfx_enabled())
+}
+
+fn feature_support(feature: u32, data: *mut c_void, size: u32, host_fidelityfx: bool) -> HRESULT {
     const OPTIONS_QUERY: u32 = 0;
     const ARCHITECTURE: u32 = 1;
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
+    const SHADER_MODEL: u32 = 7;
+    const OPTIONS1: u32 = 8;
+    const OPTIONS4: u32 = 23;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        SHADER_MODEL if host_fidelityfx => 4,
+        OPTIONS1 if host_fidelityfx => 24,
+        OPTIONS4 if host_fidelityfx => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -320,6 +330,27 @@ extern "system" fn check_feature_support(
             q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
             S_OK
         }
+        SHADER_MODEL => {
+            // SAFETY: checked size and non-null.
+            let q = unsafe { &mut *data.cast::<u32>() };
+            // The highest asked for, up to 6.6 (the AMD upscaler asks).
+            *q = (*q).min(0x66);
+            S_OK
+        }
+        OPTIONS1 => {
+            let lanes = crate::console::current().compute_units() * 64;
+            // SAFETY: checked size and non-null.
+            unsafe {
+                data.cast::<[u32; 6]>()
+                    .write_unaligned([1, 32, 64, lanes, 1, 1])
+            };
+            S_OK
+        }
+        OPTIONS4 => {
+            // SAFETY: checked size and non-null. Native 16-bit shader operations.
+            unsafe { data.cast::<[u32; 3]>().write_unaligned([0, 0, 1]) };
+            S_OK
+        }
         _ => feature_levels(data),
     }
 }
@@ -346,6 +377,62 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// `VICTORY_UNKNOWN_PIPELINE_DIR=<folder>`: every call of the two pipeline
+/// methods not implemented ([`unknown_pipeline`]) writes there what it was
+/// given, so that their descriptions can be worked out: `<slot>-<call>.txt`
+/// with the description's 32 words, and `<slot>-<call>-<word>.bin` with the
+/// bytes each (address, length) pair in it points at, and the first word's
+/// object (1 KiB). Read through the kernel: nothing is assumed mapped.
+#[cfg(windows)]
+fn dump_unknown_pipeline(slot: usize, call: u32, desc: usize) {
+    use std::io::Write;
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_UNKNOWN_PIPELINE_DIR")?);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }) else {
+        return;
+    };
+    let bytes = |at: usize, len: usize| -> Option<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        (at != 0 && crate::host::read_into(at as *const u8, &mut out)).then_some(out)
+    };
+    let Some(raw) = bytes(desc, 256) else { return };
+    let words: Vec<u64> = raw.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+    let name = format!("{slot:x}-{call}");
+    if let Ok(mut f) = std::fs::File::create(dir.join(format!("{name}.txt"))) {
+        for (i, w) in words.iter().enumerate() {
+            let _ = writeln!(f, "{i:2} {w:#018x}");
+        }
+    }
+    let write = |tag: String, at: usize, len: usize| {
+        if let Some(b) = bytes(at, len) {
+            let _ = std::fs::write(dir.join(format!("{name}-{tag}.bin")), b);
+        }
+    };
+    write("object".into(), words[0] as usize, 1024);
+    // (address, length) pairs: an address above 64 KiB followed by a length
+    // below 64 KiB.
+    for i in 0..words.len() - 1 {
+        let (at, len) = (words[i], words[i + 1]);
+        if at > 0x1_0000 && len > 0 && len < 0x1_0000 {
+            write(format!("{i:02}"), at as usize, len as usize);
+        }
+    }
+}
+
+/// Device method 0x218: compute pipelines from the console compiler's
+/// pieces ([`pipeline::create_compute_fspx`]) with `VICTORY_FSPX_PIPELINES=1`,
+/// else refused as before.
+extern "system" fn compute_fspx(this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> HRESULT {
+    if pipeline::fspx_pipelines() {
+        pipeline::create_compute_fspx(this, desc.cast(), iid, out)
+    } else {
+        unknown_pipeline::<0x218>(this, desc, iid, out)
+    }
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -369,6 +456,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    #[cfg(windows)]
+    dump_unknown_pipeline(SLOT, calls, desc as usize);
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
@@ -452,7 +541,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = compute_fspx as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -597,5 +686,33 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// The queries the AMD upscaler's capability check makes.
+    #[test]
+    fn shader_model_and_wave_options_are_the_consoles() {
+        let check = |feature, data, size| feature_support(feature, data, size, true);
+        let mut model = 0x67u32;
+        assert_eq!(check(7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(model, 0x66);
+        model = 0x62;
+        assert_eq!(check(7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(model, 0x62);
+        let mut waves = [0u32; 6];
+        assert_eq!(check(8, waves.as_mut_ptr().cast(), 24), S_OK);
+        assert_eq!(waves[..3], [1, 32, 64]);
+        let mut options4 = [0u32; 3];
+        assert_eq!(check(23, options4.as_mut_ptr().cast(), 12), S_OK);
+        assert_eq!(options4[2], 1, "native 16-bit operations");
+        assert_eq!(check(8, waves.as_mut_ptr().cast(), 16), E_INVALIDARG);
+    }
+
+    #[test]
+    fn fidelityfx_feature_queries_are_off_by_default() {
+        let mut data = [0u32; 6];
+        for (feature, size) in [(7, 4), (8, 24), (23, 12)] {
+            assert_eq!(feature_support(feature, data.as_mut_ptr().cast(), size, false), E_NOTIMPL);
+        }
+        assert_eq!(data, [0; 6]);
     }
 }

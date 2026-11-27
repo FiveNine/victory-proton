@@ -12,7 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
+//! share, [`console`] which console model the title sees, `external` host
+//! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
 #[cfg(windows)]
@@ -25,8 +26,6 @@ mod texlate;
 mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod gpuprof;
 #[cfg(windows)]
 mod compose;
 pub mod console;
@@ -47,6 +46,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod framegen;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -55,15 +56,12 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod port;
-pub use port::{port_private, port_private_gone};
 #[cfg(windows)]
 mod port_cbv;
 #[cfg(windows)]
 pub mod port_descriptors;
 #[cfg(windows)]
 mod port_journal;
-#[cfg(windows)]
-mod port_rt;
 #[cfg(windows)]
 mod land;
 pub mod list;
@@ -86,8 +84,9 @@ mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod rootstring;
+#[cfg(windows)]
 mod safecopy;
-mod vqstat;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -102,6 +101,21 @@ pub mod signature;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod spread;
+
+/// The number of `switch` among those a `VICTORY_AB` run changes, if it is
+/// one (for switches outside this crate: read once, then [`ab_on`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn ab_bit(switch: &str) -> Option<u32> {
+    ab::bit(switch)
+}
+
+/// Whether the `VICTORY_AB` switch of that number is on now.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn ab_on(bit: u32) -> bool {
+    ab::on(bit)
+}
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
@@ -137,11 +151,10 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_quiesce, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_placeholder_reserved,
+    view_watch, kernel_writing, title_memory_allocated, title_memory_freed, title_memory_unguarded, title_placeholder_released, title_placeholder_reserved, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

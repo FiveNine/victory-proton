@@ -315,8 +315,12 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// shader writes), bit 1 for `indirect` (the pass that bounds an indirect
 /// command runs without its two such waits; its state changes stay), both
 /// bits for `both`. For timing only: without the waits a shader may read
-/// what another has not finished writing.
+/// what another has not finished writing. In a `VICTORY_AB` run that
+/// names it, `both` in the phases it is on.
 pub(crate) fn barrier_test() -> u8 {
+    if let Some(on) = crate::ab::pick("VICTORY_BARRIER_TEST") {
+        return if on { 3 } else { 0 };
+    }
     static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
         Ok("groups") => 1,
@@ -1013,11 +1017,10 @@ fn log_memory() {
     tracing::info!(
         "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
          memory that is in more than one window, and is copied once for each); host lists never \
-         reset since they were made: {}; asks given a window that held them already (VICTORY_WINDOW_SHARE): {}",
+         reset since they were made: {}",
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
-        crate::shadow::SHARED.load(std::sync::atomic::Ordering::Relaxed),
     );
     if memory_categories() {
         let fields: &[(&str, u64)] = &[

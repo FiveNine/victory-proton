@@ -14,12 +14,15 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
+    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread, Sleep,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_checks_enabled, unwind_into};
+use crate::crash::{MAX_FRAMES, locate, unwind_into_guarded};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
@@ -129,10 +132,76 @@ pub fn dump_stacks() {
     }
 }
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn LdrLockLoaderLock(flags: u32, disposition: *mut u32, cookie: *mut usize) -> i32;
+    fn LdrUnlockLoaderLock(flags: u32, cookie: usize) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetTickCount64() -> u64;
+}
+
+/// One walk at a time: two walkers that suspend each other in the middle of
+/// a walk wait on each other's locks for good.
+static WALKS: Mutex<()> = Mutex::new(());
+/// The thread a walk holds suspended (its handle), for [`watch`]; 0 if none.
+static HELD: AtomicUsize = AtomicUsize::new(0);
+/// When it was suspended (`GetTickCount64`).
+static HELD_SINCE: AtomicU64 = AtomicU64::new(0);
+/// How many threads [`watch`] has resumed.
+static LET_GO: AtomicU64 = AtomicU64::new(0);
+/// How long a thread stays suspended at most. A walk takes microseconds;
+/// one that lasts this long waits on a lock its thread holds.
+const HOLD_MS: u64 = 100;
+
+/// Resumes the thread a walk holds if the walk does not end: the system's
+/// unwinder takes locks of its own, and the suspended thread may hold one
+/// (it would never give it back, and the walk would never resume it). It
+/// takes no lock and allocates nothing itself.
+fn watch() {
+    loop {
+        // SAFETY: plain sleep and query.
+        let now = unsafe {
+            Sleep(10);
+            GetTickCount64()
+        };
+        let held = HELD.load(Ordering::Acquire);
+        if held == 0 || now.saturating_sub(HELD_SINCE.load(Ordering::Acquire)) < HOLD_MS {
+            continue;
+        }
+        if HELD.compare_exchange(held, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            // SAFETY: the walk keeps the handle open until `LET_GO` counts.
+            unsafe { ResumeThread(held as HANDLE) };
+            LET_GO.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 /// The thread's frames and its current and base scheduling priority (0-31).
+/// No frames if the walk had to let the thread go before it ended.
 pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    WATCH.call_once(|| {
+        let _ = std::thread::Builder::new().name("stack watch".into()).spawn(watch);
+    });
+    let _one = WALKS.lock().unwrap_or_else(|e| e.into_inner());
+    // The loader's lock is ours before the thread stops, so it does not stop
+    // holding it: the module lookups of the walk take it.
+    let mut cookie = 0usize;
+    // SAFETY: taken here, given back below on this thread.
+    let locked = unsafe { LdrLockLoaderLock(0, std::ptr::null_mut(), &mut cookie) } >= 0;
+    let found = walk(thread);
+    if locked {
+        // SAFETY: taken above.
+        unsafe { LdrUnlockLoaderLock(0, cookie) };
+    }
+    found
+}
+
+fn walk(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
-    let checks = unwind_checks_enabled();
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
         teb: std::ptr::null(),
@@ -144,9 +213,27 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     // Suspended first: a running thread may exit and free its TEB between
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
+    let let_go = LET_GO.load(Ordering::Acquire);
+    // SAFETY: plain query.
+    HELD_SINCE.store(unsafe { GetTickCount64() }, Ordering::Release);
     if unsafe { SuspendThread(thread) } == u32::MAX {
         return (frames, (0, 0, 0));
     }
+    HELD.store(thread as usize, Ordering::Release);
+    // Resumes the thread unless the watch did (or is about to: then waits
+    // until it has, as the caller may close the handle), and says which.
+    let resume = || {
+        if HELD.swap(0, Ordering::AcqRel) == thread as usize {
+            // SAFETY: suspended above, and not resumed by the watch.
+            unsafe { ResumeThread(thread) };
+            return true;
+        }
+        while LET_GO.load(Ordering::Acquire) == let_go {
+            // SAFETY: plain sleep.
+            unsafe { Sleep(0) };
+        }
+        false
+    };
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
         NtQueryInformationThread(
@@ -158,8 +245,7 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
         )
     };
     if status != 0 || info.teb.is_null() {
-        // SAFETY: suspended above.
-        unsafe { ResumeThread(thread) };
+        resume();
         return (frames, (0, 0, 0));
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
@@ -168,14 +254,17 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     // SAFETY: zeroed is a valid CONTEXT.
     let mut context = Aligned(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
-    // SAFETY: reads and resumes the thread suspended above; nothing until
-    // the resume allocates or takes a lock the thread could hold besides
-    // the unwinder's own.
+    // SAFETY: reads the thread suspended above; nothing until the resume
+    // allocates or takes a lock the thread could hold besides the unwinder's
+    // own, and `watch` ends the wait on one of those.
     unsafe {
         if GetThreadContext(thread, &mut context.0) != 0 {
-            unwind_into(context.0, low, high, &mut frames, checks);
+            unwind_into_guarded(context.0, low, high, &mut frames);
         }
-        ResumeThread(thread);
+    }
+    if !resume() {
+        // Walked in part while the thread ran: not its stack.
+        frames.clear();
     }
     (frames, (info.priority, info.base_priority, info.affinity))
 }

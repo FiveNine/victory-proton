@@ -2,7 +2,7 @@
 //! `port_descriptors`): the title's own code that copies descriptor records
 //! into its shader-visible heap as bytes tells the layer which slots it wrote.
 //!
-//! What the title does (game_scarlett_master.exe): each draw's and each
+//! What the title does (the title's executable): each draw's and each
 //! dispatch's descriptor tables are allocated from its frame allocator
 //! (image +0x4d9f400; the allocator's memory is the placed shader-visible
 //! view heap) and filled by two functions, +0x4d9efd0 (graphics) and
@@ -38,7 +38,7 @@ pub struct Site {
     pub bytes: &'static [u8],
 }
 
-/// The six record stores of the table fillers (game_scarlett_master.exe
+/// The six record stores of the table fillers (the title's executable
 /// 1.0.2.1, image offsets).
 pub const SITES: [Site; 6] = [
     // +0x4d9efd0, loop 1: [rcx+rsi]
@@ -183,7 +183,7 @@ pub unsafe fn apply(base: usize, size: usize, marks: usize, sites: &[Site]) -> V
     out
 }
 
-/// The title's own `memcpy` (game_scarlett_master.exe 1.0.2.1, image offset).
+/// The title's own `memcpy` (the title's executable 1.0.2.1, image offset).
 pub const TITLE_MEMCPY: usize = 0x5f4_0560;
 
 /// The other writers of descriptor records into the heap, which the six
@@ -491,7 +491,7 @@ mod tests {
                 let mine = [Site { window: 0x1100, ..*site }];
                 assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
                 assert_eq!(*((place + 0x1100 + site.store) as *const u8), 0xe9);
-                let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+                let (plain, hooked): (F, F) = (std::mem::transmute::<usize, F>(plain), std::mem::transmute::<usize, F>(hooked));
                 let record: [u8; 32] = std::array::from_fn(|k| k as u8 ^ 0x5a);
                 // In the heap: slot 0x40 + 3 of its start.
                 let table = heap.add(0x2000 + 0x40 * 32);
@@ -556,7 +556,7 @@ mod tests {
             let after = COPY_128.store + COPY_128.len;
             assert_eq!(&COPY_128.bytes[after..after + 3], &[0x4c, 0x89, 0xf9]);
             assert_eq!(std::slice::from_raw_parts((place + 0x1100 + after) as *const u8, COPY_128.bytes.len() - after), &COPY_128.bytes[after..]);
-            let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+            let (plain, hooked): (F, F) = (std::mem::transmute::<usize, F>(plain), std::mem::transmute::<usize, F>(hooked));
             let records: [u8; 128] = std::array::from_fn(|k| (k as u8).wrapping_mul(7) ^ 0x3c);
             // Slots 126..130 of the heap: over the end of chunk 0.
             let table = heap.add(0x2000 + 126 * 32);

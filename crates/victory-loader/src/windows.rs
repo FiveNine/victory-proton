@@ -84,11 +84,6 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
-    if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
-        // SAFETY: just mapped, and no title code has run.
-        let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
-        tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
-    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
@@ -282,6 +277,22 @@ impl LoadedImage {
             "imports bound"
         );
         Ok(report)
+    }
+
+    /// Points every import of `symbol` (by name, from any DLL) at `address`
+    /// after [`Self::bind_imports`]; the number of slots changed.
+    pub fn override_import(&self, symbol: &str, address: usize) -> Result<usize> {
+        let slots: Vec<(u32, usize)> = self
+            .info
+            .imports
+            .iter()
+            .chain(&self.info.delay_imports)
+            .flat_map(|m| &m.entries)
+            .filter(|e| matches!(&e.symbol, ImportSymbol::Name { name, .. } if name == symbol))
+            .map(|e| (e.iat_slot_rva, address))
+            .collect();
+        self.write_slots(&slots)?;
+        Ok(slots.len())
     }
 
     /// Protects and restores each slot on its own: import tables can sit in

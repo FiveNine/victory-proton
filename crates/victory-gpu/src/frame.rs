@@ -108,6 +108,18 @@ pub(crate) extern "system" fn schedule(
     S_OK
 }
 
+/// How long ago the frame clock's current tick began; `None` before the
+/// clock runs or with no interval (no ticks).
+pub fn since_tick() -> Option<Duration> {
+    let clock = clock();
+    let c = clock.as_ref()?;
+    if c.interval.is_zero() {
+        return None;
+    }
+    let elapsed = c.start.elapsed().as_nanos();
+    Some(Duration::from_nanos((elapsed % c.interval.as_nanos().max(1)) as u64))
+}
+
 /// Frames begun so far (frame waits that ended).
 pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)

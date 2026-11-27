@@ -15,7 +15,7 @@ const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "py", "patch",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -228,6 +228,12 @@ mod tests {
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
     fn repository_passes_policy() {
+        // Under Wine the test cannot start the Linux `git` the policy lists
+        // files with; `cargo xtask policy` is then run natively instead.
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git cannot be started here; skipped (run `cargo xtask policy` natively)");
+            return;
+        }
         super::run(&crate::workspace_root(), false).unwrap();
     }
 

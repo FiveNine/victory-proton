@@ -194,6 +194,7 @@ pub(super) fn build_compute_shader(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -670,30 +671,6 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     }
 }
 
-/// `VICTORY_RAY_PROBE=1` (after DexNom/VIctory 8114ff77
-/// `memory/ray_probe.rs`): a node test over title memory counts what it
-/// finds into the faults buffer, so the program lowers (and validates) with
-/// the counters, and asks for the faults buffer and wave operations; one
-/// over a host buffer (no faults buffer bound) is as without the probe.
-#[test]
-fn the_ray_probe_counts_node_tests_over_title_memory_only() {
-    use super::RAY_PROBE_HERE;
-    let with = |on: bool, descriptor| {
-        RAY_PROBE_HERE.set(Some(on));
-        let shader = build(true, descriptor).expect("lowers").0;
-        RAY_PROBE_HERE.set(None);
-        shader
-    };
-    let (probed, plain) = (with(true, WHOLE), with(false, WHOLE));
-    assert_ne!(probed.dxil, plain.dxil, "the probe is in the translation");
-    assert!(probed.root_uavs.contains(&super::SLOT_FAULTS));
-    assert_eq!(
-        with(true, Descriptor::Table).dxil,
-        with(false, Descriptor::Table).dxil,
-        "no probe over a host buffer"
-    );
-}
-
 #[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two
@@ -798,81 +775,6 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
-}
-
-/// `VICTORY_BVH_SLOT_BOUNDS=1` (from DexNom/VIctory 8114ff77
-/// `guest_address.rs`): a picked view whose index is past the host's table
-/// reads address 0, not the last slot's (where a decoy structure is); an
-/// index inside reads its slot as before. Without the switch the index is
-/// clamped to the last slot. On WARP alone (the card may be busy with a run).
-#[test]
-fn a_picked_view_past_the_table_reads_a_zero_record_with_slot_bounds() {
-    use super::{SLOT_BOUNDS_HERE, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
-    let words = [
-        0xBE85_0380, // s_mov_b32 s5, 0
-        0x8F06_8500, // s_lshl_b32 s6, s0, 5
-        0xF408_0202,
-        0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
-        0xF408_0302,
-        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0x7E02_0208, // v_mov_b32 v1, s8
-        0x7E04_0209, // v_mov_b32 v2, s9
-        0x342A_0083, // v_lshlrev_b32 v21, 3, v0
-        0xE074_1000,
-        0x8003_0115, // buffer_store_dwordx2 v[1:2], v21, s[12:15], 0 offen
-        0xBF81_0000, // s_endpgm
-    ];
-    let build = |on: bool| {
-        SLOT_BOUNDS_HERE.set(Some(on));
-        let shader = build_compute_shader(&native(&words)).expect("the program lowers").0;
-        SLOT_BOUNDS_HERE.set(None);
-        shader
-    };
-    let (bounded, clamped) = (build(true), build(false));
-    assert_ne!(bounded.dxil, clamped.dxil, "the switch changes the translation");
-    let mut table = vec![0u32; SLOT_STRIDES_BYTES as usize / 4];
-    let at = VIEW_ADDRESSES as usize / 4;
-    // Slot 2 a structure; the last slot a decoy one.
-    table[at + 4..at + 6].copy_from_slice(&[0x1234_5600, 0x42]);
-    let last = at + 2 * (SLOT_STRIDES_COUNT as usize - 1);
-    table[last..last + 2].copy_from_slice(&[0xdead_0000, 0xdd]);
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(true) else {
-        eprintln!("no SM 6.6 WARP device; skipped");
-        return;
-    };
-    let run = |shader: &HostShader, index: u32| {
-        let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
-        let decoy = [7u32; 4];
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(vec![index, 0, 0, 0, 0])),
-                        (1, Root::View { srv: true, data: table.clone() }),
-                    ],
-                    views: &[
-                        View::Buffer { data: &decoy, stride: Stride::Raw },
-                        View::RawUav(8 * THREADS),
-                        View::Buffer { data: &decoy, stride: Stride::Raw },
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .expect("dispatch");
-        [out[0][0], out[0][1]]
-    };
-    let past = SLOT_STRIDES_COUNT + 5;
-    assert_eq!(run(&bounded, 2), [0x1234_5600, 0x42], "inside: its slot");
-    assert_eq!(run(&bounded, past), [0, 0], "past the table: a zero record");
-    assert_eq!(run(&bounded, u32::MAX >> 5), [0, 0], "far past: a zero record");
-    assert_eq!(run(&clamped, past), [0xdead_0000, 0xdd], "without the switch: the last slot");
 }
 
 /// A register that holds a lane mask on one path and a number on the other

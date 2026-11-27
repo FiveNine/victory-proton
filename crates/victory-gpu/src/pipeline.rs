@@ -501,6 +501,13 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    skipped_among(&p.shaders)
+}
+
+/// The first of `shaders` that `VICTORY_SKIP_PIPELINES` lists, if any: its
+/// pipeline is neither made on the host nor used.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn skipped_among(shaders: &[std::sync::Arc<Shader>]) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
@@ -509,7 +516,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
@@ -657,6 +664,65 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// A piece of a description: where its bytes are and how many.
+#[repr(C)]
+pub(crate) struct Piece {
+    at: *const u8,
+    len: usize,
+}
+
+/// Device method 0x218's description: a compute pipeline as the console
+/// compiler's `FSPX` blob in its four pieces (pipeline registers 0x1c B,
+/// pipeline metadata 0x14 B, the GFX10 code, the program metadata), seen
+/// alike in all 42 the title makes (2026-11-26).
+#[repr(C)]
+pub(crate) struct FspxHead {
+    root: This,
+    registers: Piece,
+    pipeline: Piece,
+    code: Piece,
+    program: Piece,
+}
+
+/// Device method 0x218 (`VICTORY_FSPX_PIPELINES=1`; off by default): the
+/// pieces put together again as the FidelityFX shaders come (one `ACCC`
+/// part), then made as any compute pipeline. Off, they are refused as
+/// before and the title goes without them. Off by default because with
+/// them made the title takes other compute shaders of its own (of 959 in
+/// the first run only 36 were among the 1,257 it uses without them), 752
+/// of which do not translate yet (a lane mask read as data, addresses of
+/// two computed terms): their passes were dropped and the screen was black
+/// (2026-11-26).
+pub(crate) extern "system" fn create_compute_fspx(
+    this: This,
+    desc: *const FspxHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let piece = |p: &Piece| -> Option<&[u8]> {
+        // SAFETY: the title passes `len` bytes at each piece's address.
+        (!p.at.is_null() && p.len > 0 && p.len < 1 << 20).then(|| unsafe { std::slice::from_raw_parts(p.at, p.len) })
+    };
+    let (Some(registers), Some(pipeline), Some(code), Some(program)) =
+        (piece(&desc.registers), piece(&desc.pipeline), piece(&desc.code), piece(&desc.program))
+    else {
+        return E_INVALIDARG;
+    };
+    let container = victory_shader::native::fspx_container(registers, pipeline, code, program);
+    let head = ComputeHead { root: desc.root, stage: Bytecode { code: container.as_ptr(), size: container.len() } };
+    create_compute(this, &head, iid, out)
+}
+
+/// Whether device method 0x218 makes its pipelines ([`create_compute_fspx`]).
+pub(crate) fn fspx_pipelines() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FSPX_PIPELINES").is_some_and(|v| v == "1"))
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -863,6 +929,49 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    /// Method 0x218's four pieces make a compute pipeline whose shader is
+    /// the `FSPX` container they came from, its program read as any.
+    #[test]
+    fn fspx_pieces_make_a_compute_pipeline() {
+        let mut registers = [0u8; 0x1c];
+        registers[0x0c..0x12].copy_from_slice(&[64, 0, 1, 0, 1, 0]);
+        let pipeline_meta = [0u8; 0x14];
+        let code = 0xbf81_0000u32.to_le_bytes(); // s_endpgm
+        let mut program = Vec::new();
+        for w in [0x403u32, 0, 1, 0, 0] {
+            program.extend_from_slice(&w.to_le_bytes());
+        }
+        program.extend_from_slice(&[0x40, 0, 0, 0]);
+        let mut hash = [0u8; 32];
+        hash[0] = 0x43;
+        program.extend_from_slice(&hash);
+        let size = program.len() as u32 - 0x14;
+        program[4..8].copy_from_slice(&size.to_le_bytes());
+        let piece = |b: &[u8]| Piece { at: b.as_ptr(), len: b.len() };
+        let desc = FspxHead {
+            root: std::ptr::null(),
+            registers: piece(&registers),
+            pipeline: piece(&pipeline_meta),
+            code: piece(&code),
+            program: piece(&program),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(create_compute_fspx(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        let kept = shaders(p);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "compute");
+        let expected = victory_shader::native::fspx_container(&registers, &pipeline_meta, &code, &program);
+        assert_eq!(kept[0].1, expected);
+        let c = victory_shader::Container::parse(&kept[0].1).unwrap();
+        let programs = victory_shader::native_programs(c.part(victory_shader::FourCC::ACCC).unwrap().data).unwrap();
+        assert_eq!(programs[0].code, code);
+        // A piece missing: refused, nothing made.
+        let mut q = std::ptr::null();
+        let desc = FspxHead { code: Piece { at: std::ptr::null(), len: 0 }, ..desc };
+        assert_eq!(create_compute_fspx(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q), E_INVALIDARG);
+        assert!(q.is_null());
     }
 
     /// The stream layout the title builds (title+0x86f090): root

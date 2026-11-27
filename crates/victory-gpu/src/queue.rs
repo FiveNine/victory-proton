@@ -901,6 +901,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1070,6 +1071,7 @@ extern "system" fn present(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
     crate::timeline::presented();
+    crate::spread::presented();
     crate::faultbook::frame();
     crate::ab::presented(|switch, was, will| {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {

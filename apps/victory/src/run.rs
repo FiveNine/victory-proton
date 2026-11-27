@@ -4,10 +4,6 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[cfg(windows)]
-#[path = "fsr_4k.rs"]
-mod fsr_4k;
-
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -57,9 +53,11 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    let fsr = fsr_4k::FsrPreset::requested()?;
+    // Before the import registry is first used: it holds the module only
+    // when the host's FidelityFX serves.
+    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let mut prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
@@ -68,24 +66,7 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = if let Some(preset) = fsr {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
-        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
-        let dir = cfg.fidelityfx_dir.as_deref().context(
-            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
-        )?;
-        // Select the provider before the first lookup builds the import registry.
-        victory_hle::modules::fidelityfx::use_host_dir(dir)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
-        // SAFETY: Windows supports setting the environment across threads.
-        // No title code has run or queried DXGI yet.
-        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
-        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
-        victory_loader::load(&prepared, &cache)?
-    } else {
-        victory_loader::load(&prepared, &images)?
-    };
+    let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -151,7 +132,7 @@ pub fn run(
         );
         println!("missing dlls   {message}");
         // None of their imports can be bound, so the title stops at its first
-        // call into one (Grand Theft Auto VI 1.0.2.1 at +0x2237178 during
+        // call into one (the title 1.0.2.1 at +0x2237178 during
         // System Init, #930) with nothing saying why. Stubs only if asked for.
         if execute && matches!(unimplemented, Unimplemented::Trap) {
             anyhow::bail!(
@@ -182,6 +163,16 @@ pub fn run(
     };
     for (name, dll) in &dlls {
         show(name, dll.bind_imports(&with_dlls, policy)?);
+        // Bink paces its videos by the counter: it gets one that steps with
+        // the frame clock's ticks (`victory_hle::modules::tick_clock`).
+        #[cfg(windows)]
+        if victory_hle::modules::tick_clock::wanted(name) {
+            let n = dll.override_import(
+                "QueryPerformanceCounter",
+                victory_hle::modules::tick_clock::query_performance_counter as *const () as usize,
+            )?;
+            println!("tick clock     {name}: {n} import(s) of QueryPerformanceCounter");
+        }
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
@@ -241,7 +232,7 @@ pub fn run(
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
     #[cfg(windows)]
-    if execute && fsr.is_none() {
+    if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
@@ -255,7 +246,7 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
+    diagnostics(&image, &cfg)?;
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -277,10 +268,14 @@ pub fn run(
     Ok(())
 }
 
-/// The debugging aids (README): scheduled stack dumps, watched values and
-/// memory saved on a crash.
+/// The debugging aids (README): title code patches, scheduled stack dumps,
+/// watched values and memory saved on a crash. An error stops the launch.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
+fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) -> Result<()> {
+    // First, before any thread started below can read or write the image.
+    if victory_hle::modules::fidelityfx::serving() {
+        crate::title_patch::apply(image)?;
+    }
     victory_loader::dump_stacks_on_schedule();
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
@@ -304,6 +299,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+    Ok(())
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
@@ -376,7 +372,7 @@ fn timers(base: usize, size: usize) {
 
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
-/// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
+/// loop has not ticked for a while (the title: 30 s) runs on
 /// through slower frames with its tick flag poked. The address must be
 /// writable title data.
 #[cfg(all(windows, feature = "diagnostics"))]

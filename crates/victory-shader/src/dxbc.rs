@@ -58,6 +58,7 @@ pub struct Part<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Container<'a> {
+    bytes: &'a [u8],
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
@@ -102,10 +103,22 @@ impl<'a> Container<'a> {
             });
         }
         Ok(Container {
+            bytes: data,
             digest,
             version,
             parts,
         })
+    }
+
+    /// A container with no parts and no bytes, for tests that need one.
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Container<'static> {
+        Container { bytes: &[], digest: [0; 16], version: (1, 0), parts: Vec::new() }
+    }
+
+    /// The declared container bytes, excluding anything after it.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
@@ -131,8 +144,7 @@ pub(crate) fn u64_at(data: &[u8], at: usize) -> Result<u64, ShaderError> {
         .ok_or(ShaderError::Malformed("truncated"))
 }
 
-/// Builds a container from parts (test helper).
-#[cfg(test)]
+/// Builds a container from parts (no digest: the layer checks none).
 pub fn build(parts: &[(FourCC, &[u8])]) -> Vec<u8> {
     let table = HEADER_SIZE + 4 * parts.len();
     let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();

@@ -298,7 +298,7 @@ fn unspill(
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
     let mut other: [Option<usize>; 256] = [None; 256]; // the last such use
-    let mut used = [false; 128];
+    let mut used = [false; 256];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
@@ -1145,6 +1145,10 @@ pub(crate) fn idoms(blocks: &[Block], order: &[usize], index: &[usize]) -> Vec<u
 /// instructions, so behaviour is unchanged.
 fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
     let limit = 4 * blocks.len() + 64;
+    // (`VICTORY_WAVE_WHY`: how much code the copies add)
+    let insts = |blocks: &[Block]| blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+    let before = (blocks.len(), insts(blocks));
+    let mut splits = 0;
     loop {
         let order = reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -1152,8 +1156,19 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             index[b] = i;
         }
         let Some((from, _)) = irreducible_edge(blocks, &order, &index) else {
+            if splits > 0 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!(
+                    "IRREDUCIBLE {splits} loop entries split: blocks {} -> {}, instructions {} -> {}",
+                    before.0,
+                    blocks.len(),
+                    before.1,
+                    insts(blocks)
+                );
+            }
+            single_latches(blocks);
             return Ok(());
         };
+        splits += 1;
         let found = multi_entry_loop(blocks, &vec![true; blocks.len()]);
         let Some((region, mut entries)) = found.filter(|_| blocks.len() < limit) else {
             return Err(ShaderError::Unsupported {
@@ -1205,6 +1220,72 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             retarget(&mut blocks[p].exit, &|s| {
                 if s == entry { copy[entry] } else { s }
             });
+        }
+        link(blocks);
+    }
+}
+
+/// Every loop jumped back to through one block, before SSA. A loop the
+/// console code continues from several places (a header that is the target
+/// of several back edges) gets an empty block they all jump to, and only it
+/// jumps back to the header: the behaviour is the same. DXC's loops have one
+/// back edge each and vkd3d-proton's DXIL to SPIR-V (dxil-spirv) relies on
+/// it: with two its loop analysis took the second for a forward edge and
+/// computed dominators round a cycle until the stack overflowed (six of a
+/// title's compute shaders never became pipelines under Proton, 2026-11-26).
+/// The empty latch is folded into its predecessor when the bitcode is
+/// written only where it has one (`emit::bitcode`).
+fn single_latches(blocks: &mut Vec<Block>) {
+    loop {
+        let order = reverse_postorder(blocks);
+        let Some(&entry) = order.first() else { return };
+        let mut index = vec![usize::MAX; blocks.len()];
+        for (i, &b) in order.iter().enumerate() {
+            index[b] = i;
+        }
+        let idom = idoms(blocks, &order, &index);
+        let dominates = |h: usize, mut b: usize| loop {
+            if b == h {
+                return true;
+            }
+            if b == entry || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
+        };
+        let several = order.iter().find_map(|&h| {
+            let mut sources: Vec<usize> = blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&b| index[b] != usize::MAX && index[b] >= index[h] && dominates(h, b))
+                .collect();
+            sources.sort_unstable();
+            sources.dedup();
+            (sources.len() > 1).then_some((h, sources))
+        });
+        let Some((header, sources)) = several else { return };
+        let latch = blocks.len();
+        blocks.push(Block {
+            offset: blocks[header].offset,
+            preds: Vec::new(),
+            phis: Vec::new(),
+            insts: Vec::new(),
+            exit: Exit::Jump(header),
+        });
+        for b in sources {
+            match &mut blocks[b].exit {
+                Exit::Jump(s) if *s == header => *s = latch,
+                Exit::Branch { taken, not_taken } => {
+                    if *taken == header {
+                        *taken = latch;
+                    }
+                    if *not_taken == header {
+                        *not_taken = latch;
+                    }
+                }
+                _ => {}
+            }
         }
         link(blocks);
     }
@@ -1778,11 +1859,64 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
 mod tests {
     use super::*;
 
+    /// A loop continued from two places (two back edges to its header) is
+    /// continued through one empty latch, both places jumping to it; a loop
+    /// with one back edge is left alone.
+    #[test]
+    fn a_loop_continued_from_two_places_gets_one_latch() {
+        let block = |exit| Block { offset: 0, preds: Vec::new(), phis: Vec::new(), insts: Vec::new(), exit };
+        // 0 -> 1 (header) -> 2 | 3; 2 -> 1 (back) | 4; 3 -> 1 (back) | 4; 4 ends.
+        let mut blocks = vec![
+            block(Exit::Jump(1)),
+            block(Exit::Branch { taken: 2, not_taken: 3 }),
+            block(Exit::Branch { taken: 1, not_taken: 4 }),
+            block(Exit::Branch { taken: 1, not_taken: 4 }),
+            block(Exit::End),
+        ];
+        link(&mut blocks);
+        single_latches(&mut blocks);
+        assert_eq!(blocks.len(), 6);
+        assert_eq!(blocks[5].exit, Exit::Jump(1));
+        assert!(blocks[5].insts.is_empty());
+        let mut header_preds = blocks[1].preds.clone();
+        header_preds.sort_unstable();
+        assert_eq!(header_preds, [0, 5]);
+        assert_eq!(blocks[2].exit, Exit::Branch { taken: 5, not_taken: 4 });
+        assert_eq!(blocks[3].exit, Exit::Branch { taken: 5, not_taken: 4 });
+        // Once is enough: nothing more to do.
+        single_latches(&mut blocks);
+        assert_eq!(blocks.len(), 6);
+        // One back edge: untouched.
+        let mut one = vec![block(Exit::Jump(1)), block(Exit::Branch { taken: 1, not_taken: 2 }), block(Exit::End)];
+        link(&mut one);
+        single_latches(&mut one);
+        assert_eq!(one.len(), 3);
+    }
+
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         build(&code, wave64, 256).unwrap()
+    }
+
+    /// A scalar destination field of 128 or more (a constant's code, not a
+    /// register) is refused or ignored, never an index past the scalar
+    /// codes the parking search keeps (found by fuzzing the translator).
+    #[test]
+    fn scalar_codes_past_the_registers_do_not_panic() {
+        // v_writelane_b32 v1, s0, 0: a program that parks a scalar, so the
+        // parking search runs.
+        const PARK: [u32; 2] = [0xD761_0001, 0x0001_0000];
+        for (words, wave64) in [
+            ([0xD4C5_A8D7, 0x9342_BFA0], true),
+            ([0xD401_53FF, 0x0509_8D04], false),
+            ([0xD4EC_FE8B, 0x1234_5678], false),
+        ] {
+            let words = [&PARK[..], &words[..], &[S_ENDPGM]].concat();
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = build(&code, wave64, 256);
+        }
     }
 
     fn input(p: &Program, reg: Reg) -> Value {

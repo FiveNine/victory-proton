@@ -15,6 +15,9 @@ mod host;
 mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::frame_phase;
+/// `VICTORY_AB` switches for the front end's own code (its `memcmp`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::{ab_bit, ab_on};
 pub use victory_gpu::frames_begun;
 
 pub mod modules;

@@ -194,12 +194,13 @@ struct Inner {
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
     scheduled: bool,
-    /// The title needs the open back list for a synchronous host API call.
-    waiting_for_back: bool,
     /// The list of ours (0: none yet).
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// A thread translates a chunk of it, or holds it ([`with_back_now`]):
+    /// no other one may.
+    translating: bool,
 }
 
 impl Recording {
@@ -235,16 +236,20 @@ impl Recording {
         loop {
             let (chunk, back) = {
                 let mut inner = held(&self.inner);
+                // Another thread has it ([`with_back_now`]): that one goes on
+                // with what comes after, and schedules it again.
+                if inner.translating {
+                    inner.scheduled = false;
+                    return;
+                }
                 let Some(chunk) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
-                    if inner.waiting_for_back {
-                        self.moved.notify_all();
-                    }
                     return;
                 };
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
                 }
+                inner.translating = true;
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
@@ -252,6 +257,8 @@ impl Recording {
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
+            inner.translating = false;
+            self.moved.notify_all();
             inner.kept.push(chunk);
             if closed {
                 inner.closed = true;
@@ -332,6 +339,52 @@ fn start() {
     tracing::info!(threads, "list calls are written down and translated by threads of ours (VICTORY_THIN=1)");
 }
 
+/// Runs `f` on the list of ours behind the title list `this`, with every call
+/// written to it so far translated there, in order, on this thread (the title's,
+/// which records `this` and so writes nothing more meanwhile): for what is
+/// recorded into a list outside its methods (the host's FidelityFX dispatch),
+/// which needs the host list as the calls before it left it. `None` if `this`
+/// has no recording under way.
+pub(crate) fn with_back_now<R>(this: This, f: impl FnOnce(This) -> R) -> Option<R> {
+    let front = front(this);
+    if front.closed {
+        return None;
+    }
+    let recording = front.recording.clone()?;
+    front.hand_over();
+    let mut inner = held(&recording.inner);
+    // A thread of ours in the middle of a chunk: after it.
+    while inner.translating {
+        inner = recording.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+    }
+    if inner.back == 0 {
+        inner.back = back_list(recording.kind) as usize;
+    }
+    let back = inner.back as This;
+    inner.translating = true;
+    while let Some(chunk) = inner.chunks.pop_front() {
+        drop(inner);
+        let (calls, _) = translate(back, &chunk, || recording.abandoned.load(Acquire));
+        STATS[0].fetch_add(calls, Relaxed);
+        inner = held(&recording.inner);
+        inner.kept.push(chunk);
+    }
+    drop(inner);
+    let out = f(back);
+    let mut inner = held(&recording.inner);
+    inner.translating = false;
+    // What the title writes next is scheduled as it is handed over.
+    inner.scheduled = !inner.chunks.is_empty();
+    let again = inner.scheduled;
+    drop(inner);
+    recording.moved.notify_all();
+    if again {
+        held(&READY).push_back(recording);
+        WORK.notify_one();
+    }
+    Some(out)
+}
+
 /// The recordings of submitted lists, in order (one that was not begun is left
 /// out).
 pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
@@ -369,31 +422,6 @@ fn front<'a>(this: This) -> &'a mut Front {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time.
     unsafe { &mut (*this.cast_mut().cast::<List>()).thin }
-}
-
-/// Lets a host API record at the current position of the title's open list.
-/// The caller is the sole writer of this list until its API call returns.
-/// Only preceding chunks of this recording have to finish translation.
-pub(crate) fn for_external(this: This) -> Option<This> {
-    if this.is_null() {
-        return None;
-    }
-    if super::host_list(this).is_some() {
-        return Some(this);
-    }
-    let front = front(this);
-    if front.closed {
-        return None;
-    }
-    front.hand_over();
-    let recording = front.recording.as_ref()?;
-    let mut inner = held(&recording.inner);
-    if inner.scheduled {
-        inner.waiting_for_back = true;
-        inner = recording.moved.wait_while(inner, |i| i.scheduled).unwrap_or_else(|e| e.into_inner());
-        inner.waiting_for_back = false;
-    }
-    (inner.back != 0).then_some(inner.back as This)
 }
 
 /// An argument as a word.
@@ -578,6 +606,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    // Diagnostics: what they ask for, read here while the title's groups
+    // are there (`VICTORY_GROUP_NOTES=1`; the replay has none).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if count > 0 {
+        super::group_note(count, _groups);
+    }
     front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
@@ -904,6 +938,45 @@ mod tests {
                 "slot {slot} is written down and not there"
             );
         }
+    }
+
+    /// What a library records into a title list outside its methods (the
+    /// host's FidelityFX dispatch) finds the list of ours behind it with all
+    /// that was written before translated, in order; what is written after is
+    /// handed over as before.
+    #[cfg(windows)]
+    #[test]
+    fn a_step_outside_the_methods_comes_after_what_was_written() {
+        let list: This = Box::into_raw(super::super::boxed(0, std::ptr::null(), false)).cast_const().cast();
+        let f = front(list);
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(Plain::TOPOLOGY as u64, &[4]);
+        f.put(Plain::STENCIL_REF as u64, &[7]);
+        let recording = f.recording.clone().unwrap();
+        let mut seen = None;
+        let out = with_back_now(list, |back| {
+            let inner = held(&recording.inner);
+            seen = Some((back, inner.back as This, inner.chunks.len(), inner.kept.len(), inner.translating));
+            5
+        });
+        assert_eq!(out, Some(5));
+        let (back, kept_back, chunks, kept, translating) = seen.expect("ran");
+        assert!(!back.is_null() && back == kept_back, "the list of ours behind it");
+        assert_eq!((chunks, kept), (0, 1), "all that was written translated first");
+        assert!(translating, "no other thread translates it meanwhile");
+        {
+            let inner = held(&recording.inner);
+            assert!(!inner.translating && !inner.scheduled && inner.chunks.is_empty());
+        }
+        // Written after: handed over and scheduled as ever.
+        let f = front(list);
+        f.put(Plain::TOPOLOGY as u64, &[5]);
+        f.hand_over();
+        assert!(held(&recording.inner).scheduled);
+        assert!(front(list).words.is_empty());
+        // Without a recording: nothing to run on.
+        let plain: This = Box::into_raw(super::super::boxed(0, std::ptr::null(), false)).cast_const().cast();
+        assert_eq!(with_back_now(plain, |_| 1), None);
     }
 
     /// Arguments come out of a stream as they went in.
