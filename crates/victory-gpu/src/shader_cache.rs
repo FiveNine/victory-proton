@@ -103,6 +103,13 @@ fn build() -> [u8; 32] {
         };
         bytes.extend_from_slice(&FORMAT.to_le_bytes());
         bytes.extend_from_slice(&limit.to_le_bytes());
+        // (So is the limit of walks through ray-tracing structures; the
+        // default adds nothing, so caches made before it stay good.)
+        let walks = victory_shader::emit::walk_limit();
+        if walks != victory_shader::emit::DEFAULT_WALK_LIMIT {
+            bytes.extend_from_slice(b"walks");
+            bytes.extend_from_slice(&walks.to_le_bytes());
+        }
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:

@@ -86,6 +86,7 @@ const ARENA: u64 = 64 << 20;
 const PIECE: usize = 4096;
 /// Pages held, at most (3 GiB).
 const MOST: usize = 3 << 14;
+
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
 /// The biggest packed structure taken for one.
@@ -117,6 +118,22 @@ fn faults_all() -> usize {
         std::env::var("VICTORY_BVH_FAULTS_ALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
     })
 }
+/// Pages that keep faulting: past [`FAULTS_ALL`] a page is still taken once
+/// it has faulted in [`persist`]`.0` frames, up to `.1` such pages. Most
+/// faults are pages a garbage pointer reached once; the cap in all went on
+/// those in the first seconds, and the pages rays read every frame read
+/// zeros for the rest of the run: structures with holes, and ray-traced
+/// light that pulsed from frame to frame indoors.
+/// `VICTORY_FAULT_PERSIST=<frames>,<pages>` (0 frames: off).
+fn persist() -> (u32, usize) {
+    static SET: std::sync::OnceLock<(u32, usize)> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_FAULT_PERSIST").unwrap_or_default();
+        let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
+        (n.next().flatten().unwrap_or(3) as u32, n.next().flatten().unwrap_or(16384))
+    })
+}
+
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -182,6 +199,16 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
+    /// Pages that faulted: the frames they did in, and the last.
+    fault_seen: HashMap<u64, (u32, u64)>,
+    /// Pages taken for faulting in several frames, and for a dropped store.
+    persisted: usize,
+    stored: usize,
+    /// Structures whose compacted size the builder was asked for: where the
+    /// size goes ([`Memory::size_of_copy`]).
+    size_slots: HashMap<u64, u64>,
+    /// Copies of structures over 4 MiB readied whole.
+    copies_sized: u64,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -265,6 +292,11 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
+            fault_seen: HashMap::new(),
+            persisted: 0,
+            stored: 0,
+            size_slots: HashMap::new(),
+            copies_sized: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -670,9 +702,26 @@ impl Memory {
         }
     }
 
+    /// The size of a structure the builder copies (compacts) from `from`: what
+    /// the title read for it from the slot its size was asked into, if that
+    /// is a size over 4 MiB and under 64 MiB. The copy wrote it whole: past
+    /// the 4 MiB readied from a written view its stores were dropped and the
+    /// structure stood cut off (rays went through big geometry).
+    fn size_of_copy(&self, from: u64) -> Option<u64> {
+        if from < 1 << 32 || crate::shadow::in_buffer(from, 1).is_some() {
+            return None;
+        }
+        let slot = *self.size_slots.get(&from)?;
+        let mut b = [0u8; 8];
+        crate::host::copy_mapped(b.as_mut_ptr(), slot as *const u8, 8, false);
+        let len = u64::from_le_bytes(b);
+        (BUILT < len && len <= 64 << 20).then_some(len)
+    }
+
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
+        let mut stores = std::collections::HashSet::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
@@ -680,6 +729,13 @@ impl Memory {
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
             if page != 0 {
+                // (The shader's marks above the page's number: a store in
+                // bit 31, a program that traces rays in bit 30.)
+                let noted = page;
+                let page = noted & 0x3FFF_FFFF;
+                if noted & 1 << 31 != 0 {
+                    stores.insert(u64::from(page));
+                }
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -689,6 +745,7 @@ impl Memory {
             return;
         }
         pages.sort_unstable();
+        pages.dedup();
         let mut made = 0;
         let all = faults_all();
         for &page in &pages {
@@ -696,10 +753,34 @@ impl Memory {
             if self.copy_of(page).is_some() {
                 continue;
             }
-            if made < FAULTS && self.faulted < all {
+            // A store that found no page was dropped: the structure it wrote
+            // has a hole until it is written again. Those pages are few and
+            // taken past the cap in all. So is a page that keeps faulting
+            // ([`persist`]).
+            let stored = stores.contains(&page);
+            let (frames, most) = persist();
+            let seen = {
+                if self.fault_seen.len() > 1 << 20 {
+                    self.fault_seen.retain(|_, s| s.0 >= 2);
+                }
+                let frame = self.frame;
+                let e = self.fault_seen.entry(page).or_insert((0, u64::MAX));
+                if e.1 != frame {
+                    *e = (e.0 + 1, frame);
+                }
+                e.0
+            };
+            let kept = frames > 0 && seen >= frames && self.persisted < most;
+            let past_cap = self.faulted >= all;
+            if made < FAULTS && (!past_cap || stored || kept) {
                 if self.map(page) {
                     made += 1;
                     self.faulted += 1;
+                    if past_cap && stored {
+                        self.stored += 1;
+                    } else if past_cap {
+                        self.persisted += 1;
+                    }
                     self.bring(page, page + 1);
                 }
             } else {
@@ -832,6 +913,12 @@ impl Memory {
             s.left as f64 / frames,
             faults_all()
         );
+        tracing::info!(
+            persisted = self.persisted,
+            stored = self.stored,
+            copies_sized = self.copies_sized,
+            "title memory by address: pages taken past the cap in all (for faulting in several frames, for a dropped store); big structures' copies readied whole"
+        );
         self.stats.from = Some((now, self.frame));
     }
 }
@@ -892,6 +979,15 @@ fn close(entry: *mut u32, n: usize, offset: u64) {
 
 /// The offset first: a shader that sees the number sees it too.
 fn fill(entry: *mut u32, n: usize, offset: u64) {
+    // The ray-tracing node test reads a node's 16-byte quarters as such
+    // (`victory_shader::emit` `bvh_node_words`): a page on less than 16
+    // bytes in its copy would read the wrong bytes there.
+    if offset % 16 != 0 {
+        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            tracing::warn!(offset, "a page of title memory lies on less than 16 bytes in its copy");
+        }
+    }
     // SAFETY: an entry of the directory, under the mutex.
     unsafe {
         entry.add(1).write_volatile(offset as u32);
@@ -968,6 +1064,26 @@ pub(crate) fn ready(
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
+    }
+    if builds
+        && asks_size(written, constants, threads)
+        && let [lo, hi, 1, ..] = *constants
+        && let Some(&slot) = written.first()
+    {
+        if m.size_slots.len() > 1 << 16 {
+            m.size_slots.clear();
+        }
+        m.size_slots.insert(u64::from(lo) | u64::from(hi) << 32, slot);
+    }
+    if builds
+        && threads == Some([32, 1, 1])
+        && let [from, to] = *written
+        && let Some(len) = m.size_of_copy(from)
+        && list.first_use(usize::MAX - (6 << 33) - (to >> 2 & 0x7FFF_FFFF) as usize)
+    {
+        m.ready(from, len);
+        m.ready(to, len);
+        m.copies_sized += 1;
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
