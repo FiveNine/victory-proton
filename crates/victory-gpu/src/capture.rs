@@ -128,6 +128,9 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    if drawn.saturating_sub(before) >= 500 {
+        let _ = HEAVY_AT.get_or_init(std::time::Instant::now);
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -142,6 +145,48 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// When the first frame of 500 draws or more was presented.
+static HEAVY_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// `VICTORY_CAPTURE_TIME=<from s>,<to s>,<every ms>`: frames saved by the
+/// time since the first frame of 500 draws or more, not by their number
+/// (which shot a frame number falls on moves with the frame rate, so runs
+/// could not be compared). Each saved frame's number and time go to
+/// `times.txt`.
+fn by_time(n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SET: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let Some((from, to, every)) = *SET.get_or_init(|| {
+        let v = std::env::var("VICTORY_CAPTURE_TIME").ok()?;
+        let mut p = v.split(',').map(|x| x.trim().parse::<f64>().ok());
+        let (a, b, c) = (p.next()??, p.next()??, p.next()??);
+        Some(((a * 1000.0) as u64, (b * 1000.0) as u64, (c as u64).max(1)))
+    }) else {
+        return false;
+    };
+    // (Asked more than once for a frame: the answer stays.)
+    static TAKEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    if TAKEN.load(Relaxed) == n {
+        return true;
+    }
+    let Some(at) = HEAVY_AT.get() else { return false };
+    let ms = at.elapsed().as_millis() as u64;
+    let next = NEXT.load(Relaxed).max(from);
+    if ms < next || ms > to {
+        return false;
+    }
+    NEXT.store((ms / every + 1) * every, Relaxed);
+    TAKEN.store(n, Relaxed);
+    if let Some(folder) = folder() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(folder.join("times.txt")) {
+            let _ = writeln!(f, "{n} {ms}");
+        }
+    }
+    true
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
@@ -152,7 +197,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || by_time(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

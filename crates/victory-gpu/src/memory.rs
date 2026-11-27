@@ -167,13 +167,21 @@ fn fault_windows() -> bool {
 /// recorded with the old entry may still be on their way.
 const COOL: u64 = 6;
 
-/// [`FAULTS`] and [`FAULTS_ALL`], or `VICTORY_FAULT_CAPS=<a frame>,<in all>`.
+/// Pages taken from the faults in all (`VICTORY_BVH_FAULTS_ALL=<n>`, as
+/// upstream e823263 names it; unset: [`FAULTS_ALL`]).
+fn faults_all() -> usize {
+    fault_caps().1
+}
+
+/// [`FAULTS`] and [`FAULTS_ALL`], or `VICTORY_FAULT_CAPS=<a frame>,<in all>`
+/// (`VICTORY_BVH_FAULTS_ALL` for the second as well).
 fn fault_caps() -> (usize, usize) {
     static SET: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_FAULT_CAPS").unwrap_or_default();
         let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
-        let caps = (n.next().flatten().unwrap_or(FAULTS), n.next().flatten().unwrap_or(FAULTS_ALL));
+        let all = std::env::var("VICTORY_BVH_FAULTS_ALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL);
+        let caps = (n.next().flatten().unwrap_or(FAULTS), n.next().flatten().unwrap_or(all));
         if caps != (FAULTS, FAULTS_ALL) {
             tracing::info!(frame = caps.0, all = caps.1, "title memory by address: pages taken from the faults");
         }
@@ -873,6 +881,21 @@ impl Memory {
             }
         }
         self.stats.faults += pages.len() as u64;
+        // The first frames that leave pages without a copy: all of them, and
+        // which of them hold a packed structure's first bytes or lie in a
+        // title buffer (to tell walked structures from stray pointers).
+        static WHOLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if made < pages.len() && self.faulted >= faults_all() && WHOLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            let mut text = String::new();
+            for &page in pages.iter().filter(|&&p| self.copy_of(p).is_none()) {
+                let at = page * PAGE;
+                let committed = crate::texture::committed(at as *const u8, PAGE as usize);
+                let buffer = crate::shadow::in_buffer(at, 1).is_some();
+                let packed = committed && self.packed_at(at).is_some();
+                text += &format!(" {at:#x}{}{}{}", if committed { "" } else { "?" }, if buffer { "b" } else { "" }, if packed { "p" } else { "" });
+            }
+            tracing::warn!(frame = self.frame, "title memory by address: pages left without a copy by the bounds (?: not committed, b: in a title buffer, p: a packed structure there):{text}");
+        }
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -41,6 +41,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -59,6 +61,8 @@ mod port_cbv;
 pub mod port_descriptors;
 #[cfg(windows)]
 mod port_journal;
+#[cfg(windows)]
+mod port_rt;
 #[cfg(windows)]
 mod land;
 pub mod list;
