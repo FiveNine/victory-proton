@@ -11739,17 +11739,26 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
-            // In programs that trace rays, a NaN is stored as 0. A ray's
-            // hit read from a page of title memory the host had no copy of
-            // (zeros: a normal of length 0) gave NaNs, which the title's
-            // filters after the trace spread into black blocks over
-            // reflections. A 0 stays one dark pixel the filters hide.
+            // In programs that trace rays, a value with a NaN is not stored:
+            // the texel keeps what it held. A ray's hit read from a page of
+            // title memory the host had no copy of (zeros: a normal of
+            // length 0) gave NaNs, which the title's filters after the trace
+            // spread into black blocks over reflections; stored as 0 (as
+            // until TRANSLATOR_VERSION 11) they were still black tiles on
+            // windows and pictures, where the texel's last value is close.
+            let mut guard = guard;
             if self.traces_rays() {
-                let zero = self.s.m.f32(0);
-                for v in &mut vals {
+                let mut any = self.s.m.bool(false);
+                for v in &vals {
                     let nan = self.is_nan_f32(*v);
-                    *v = self.s.m.select(self.cur, nan, zero, *v);
+                    any = self.s.m.bin(self.cur, Bin::Or, any, nan);
                 }
+                let on = self.s.m.bool(true);
+                let fine = self.s.m.bin(self.cur, Bin::Xor, any, on);
+                guard = Some(match guard {
+                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, fine),
+                    None => fine,
+                });
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
