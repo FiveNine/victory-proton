@@ -222,6 +222,11 @@ struct Memory {
     cooling: std::collections::VecDeque<(u64, usize, usize)>,
     /// Pages given back for the budget.
     evicted: u64,
+    /// Faults (frame, page with marks) for `VICTORY_FAULT_LIST`.
+    fault_log: Vec<(u64, u32)>,
+    /// Structures whose compacted size the builder was asked for: where the
+    /// size goes ([`Memory::size_of_copy`]).
+    size_slots: HashMap<u64, u64>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -257,6 +262,10 @@ struct Stats {
     /// Faults by what found them: loads, loads of programs that trace rays,
     /// stores, stores of such programs.
     kinds: [u64; 4],
+    /// Faults on pages a window outside buffers holds already.
+    in_window: u64,
+    /// Copies of structures over 4 MiB readied whole.
+    copies_sized: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -310,6 +319,8 @@ impl Memory {
             ghost_order: std::collections::VecDeque::new(),
             cooling: std::collections::VecDeque::new(),
             evicted: 0,
+            fault_log: Vec::new(),
+            size_slots: HashMap::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -718,6 +729,7 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
+        let mut stores = std::collections::HashSet::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
@@ -728,6 +740,15 @@ impl Memory {
                 // (The shader's marks: a store, a program that traces rays.)
                 self.stats.kinds[(noted >> 30) as usize] += 1;
                 let page = noted & 0x3FFF_FFFF;
+                if noted & 1 << 31 != 0 {
+                    stores.insert(u64::from(page));
+                }
+                if crate::shadow::window_over(u64::from(page) * PAGE, PAGE).is_some() {
+                    self.stats.in_window += 1;
+                }
+                if self.fault_log.len() < 1 << 20 {
+                    self.fault_log.push((self.frame, noted));
+                }
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -745,7 +766,11 @@ impl Memory {
         }
         for &page in &pages {
             let (frame_cap, all_cap) = fault_caps();
-            if made >= frame_cap || (budget == 0 && self.faulted >= all_cap) || self.copy_of(page).is_some() {
+            // A store that found no page was dropped: the structure it wrote
+            // has a hole until it is written again. Those pages are few
+            // (1,628 in 130 s, run fl) and taken past the cap in all.
+            let stored = stores.contains(&page);
+            if made >= frame_cap || (budget == 0 && self.faulted >= all_cap && !stored) || self.copy_of(page).is_some() {
                 continue;
             }
             let again = budget > 0 && self.ghosts.remove(&page);
@@ -785,6 +810,23 @@ impl Memory {
                 "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
             );
         }
+    }
+
+    /// The size of a structure the builder copies (compacts) from `from`: what
+    /// the title read for it from the slot its size was asked into, if that
+    /// is a size over 4 MiB and under 64 MiB. The copy wrote it whole: past
+    /// the 4 MiB readied from a written view its stores were dropped and the
+    /// structure stood cut off. Of 937 structures 17 were over 4 MiB, up to
+    /// 48 MiB, all of them 358 MB (run bt, 2026-11-27).
+    fn size_of_copy(&self, from: u64) -> Option<u64> {
+        if from < 1 << 32 || crate::shadow::in_buffer(from, 1).is_some() {
+            return None;
+        }
+        let slot = *self.size_slots.get(&from)?;
+        let mut b = [0u8; 8];
+        crate::host::copy_mapped(b.as_mut_ptr(), slot as *const u8, 8, false);
+        let len = u64::from_le_bytes(b);
+        (BUILT < len && len <= 64 << 20).then_some(len)
     }
 
     /// Gives back the oldest page taken from the faults that nothing else
@@ -875,11 +917,26 @@ impl Memory {
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
+        // `VICTORY_FAULT_LIST=<file>`: the pages held (page, packed owners,
+        // theirs, born) and the faults so far (frame, page with marks).
+        if let Some(file) = std::env::var_os("VICTORY_FAULT_LIST") {
+            let mut text = String::new();
+            for (page, h) in &self.pages {
+                text += &format!("H {page:#x} {} {} {}\n", h.owners, h.theirs as u8, h.born);
+            }
+            for (address, p) in &self.packed {
+                text += &format!("P {address:#x} {}\n", p.len);
+            }
+            for &(frame, noted) in &self.fault_log {
+                text += &format!("F {frame} {noted:#x}\n");
+            }
+            let _ = std::fs::write(file, text);
+        }
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -907,7 +964,9 @@ impl Memory {
             s.kinds[0] as f64 / frames,
             s.kinds[1] as f64 / frames,
             s.kinds[2] as f64 / frames,
-            s.kinds[3] as f64 / frames
+            s.kinds[3] as f64 / frames,
+            s.in_window as f64 / frames,
+            s.copies_sized
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -1054,6 +1113,26 @@ pub(crate) fn ready(
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
+    }
+    if builds
+        && asks_size(written, constants, threads)
+        && let [lo, hi, 1, ..] = *constants
+        && let Some(&slot) = written.first()
+    {
+        if m.size_slots.len() > 1 << 16 {
+            m.size_slots.clear();
+        }
+        m.size_slots.insert(u64::from(lo) | u64::from(hi) << 32, slot);
+    }
+    if builds
+        && threads == Some([32, 1, 1])
+        && let [from, to] = *written
+        && let Some(len) = m.size_of_copy(from)
+        && list.first_use(usize::MAX - (6 << 33) - (to >> 2 & 0x7FFF_FFFF) as usize)
+    {
+        m.ready(from, len);
+        m.ready(to, len);
+        m.stats.copies_sized += 1;
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;

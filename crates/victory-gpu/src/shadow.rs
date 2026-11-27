@@ -5420,6 +5420,26 @@ fn fine() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    // `VICTORY_WINDOW_LIST=<file>`: the windows (start, bytes, whether a
+    // list or slot holds them, unsized asks) written there each time.
+    if let Some(file) = std::env::var_os("VICTORY_WINDOW_LIST") {
+        let text: String = loose
+            .iter()
+            .map(|(&(start, bytes), s)| {
+                let used = s.used.load(Ordering::Relaxed);
+                let now = crate::host::moment();
+                format!(
+                    "{start:#x} {bytes} {} {} {} {} {}\n",
+                    Arc::strong_count(s),
+                    s.unsized_asks.load(Ordering::Relaxed),
+                    crate::host::references(&s.buffer),
+                    (now >> 32).saturating_sub(used >> 32),
+                    (now & 0xffff_ffff).saturating_sub(used & 0xffff_ffff)
+                )
+            })
+            .collect();
+        let _ = std::fs::write(file, text);
+    }
     cover(loose.keys().copied())
 }
 
@@ -5527,6 +5547,17 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     Some(shadow)
+}
+
+/// The window outside buffers that holds the 64 KiB page at `start`
+/// whole, if one is there (the longest).
+pub(crate) fn window_over(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let from = start.saturating_sub(64 << 20);
+    map.range((from, 0)..=(start, u64::MAX))
+        .filter(|&(&(s, l), sh)| s <= start && s + l >= start + len && !sh.mapped)
+        .max_by_key(|&(&(_, l), _)| l)
+        .map(|(_, sh)| sh.clone())
 }
 
 /// Copies of title memory outside buffers, by (start, length).
