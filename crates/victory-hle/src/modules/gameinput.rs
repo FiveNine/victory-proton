@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -154,11 +154,15 @@ fn mouse_auto() -> bool {
     *ON
 }
 
-/// Driving keys of the PC layout: W and S also press the throttle (RT) and
-/// the brake (LT), Space the handbrake (RB) in place of jump. The pad cannot
-/// tell a car from a pavement, so this is a mode: F (enter or leave a
-/// vehicle) turns it over, F5 turns it over by hand when it is out of step.
-static VEHICLE_KEYS: AtomicBool = AtomicBool::new(false);
+/// The PC layout's modes, picked by the player (the pad cannot tell a
+/// pavement from a car or a plane): F5 on foot, F6 vehicle (cars, bikes,
+/// boats: W and S also throttle (RT) and brake (LT), Space the handbrake
+/// (RB)), F7 aircraft (W and S throttle up (RT) and down (LT), A and D yaw
+/// (LB, RB), arrows or numpad 8/2/4/6 pitch and roll on the left stick).
+const ON_FOOT: u32 = 0;
+const VEHICLE: u32 = 1;
+const AIRCRAFT: u32 = 2;
+static KEYS_MODE: AtomicU32 = AtomicU32::new(ON_FOOT);
 
 /// Mouse-look sensitivity multiplier for `VICTORY_KBM_PC=1`
 /// (`VICTORY_MOUSE_SENS`, default `1.0`).
@@ -306,26 +310,22 @@ trait Source: Send {
 fn fallback(keys: &[KeyState]) -> PadState {
     let pc = pc_kbm();
     if pc {
-        // F (enter / leave a vehicle) and F5 turn the driving keys over, on
-        // the press.
-        static HELD: AtomicU32 = AtomicU32::new(0);
-        let held = |vk: u8| keys.iter().any(|k| k.virtual_key == vk);
-        let now = u32::from(held(b'F')) | u32::from(held(0x74)) << 1;
-        let before = HELD.swap(now, Ordering::Relaxed);
-        if now & !before != 0 {
-            let driving = !VEHICLE_KEYS.fetch_xor(true, Ordering::Relaxed);
-            tracing::info!(driving, "keyboard: driving keys (F / F5)");
+        // F5, F6, F7: on foot, vehicle, aircraft.
+        for (vk, mode, name) in [(0x74u8, ON_FOOT, "on foot"), (0x75, VEHICLE, "vehicle"), (0x76, AIRCRAFT, "aircraft")] {
+            if keys.iter().any(|k| k.virtual_key == vk) && KEYS_MODE.swap(mode, Ordering::Relaxed) != mode {
+                tracing::info!(mode = name, "keyboard mode (F5 on foot, F6 vehicle, F7 aircraft)");
+            }
         }
     }
-    fallback_with(keys, pc, pc && VEHICLE_KEYS.load(Ordering::Relaxed))
+    fallback_with(keys, pc, if pc { KEYS_MODE.load(Ordering::Relaxed) } else { ON_FOOT })
 }
 
 #[cfg(test)]
 fn fallback_for(keys: &[KeyState], pc_style: bool) -> PadState {
-    fallback_with(keys, pc_style, false)
+    fallback_with(keys, pc_style, ON_FOOT)
 }
 
-fn fallback_with(keys: &[KeyState], pc_style: bool, driving: bool) -> PadState {
+fn fallback_with(keys: &[KeyState], pc_style: bool, mode: u32) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -338,19 +338,43 @@ fn fallback_with(keys: &[KeyState], pc_style: bool, driving: bool) -> PadState {
         .iter()
         .filter(|(vk, _)| on(*vk) != 0.0)
         .fold(0, |all, (_, bit)| all | bit);
-    if driving && on(0x20) != 0.0 {
+    let either = |a: u8, b: u8| f32::max(on(a), on(b));
+    if mode == VEHICLE && on(0x20) != 0.0 {
         // Space: the handbrake (RB), not jump (X) while driving.
         buttons = (buttons & !X) | RIGHT_SHOULDER;
         if on(b'X') != 0.0 {
             buttons |= X;
         }
     }
+    if mode == AIRCRAFT {
+        // A and D yaw (LB, RB); the arrows fly, they are no D-pad here.
+        buttons &= !(UP | DOWN | LEFT | RIGHT);
+        if on(b'E') != 0.0 {
+            buttons |= RIGHT; // E: interact (D-pad right) as on foot
+        }
+        if on(b'M') != 0.0 {
+            buttons |= UP;
+        }
+        if on(b'A') != 0.0 {
+            buttons |= LEFT_SHOULDER;
+        }
+        if on(b'D') != 0.0 {
+            buttons |= RIGHT_SHOULDER;
+        }
+    }
+    let throttle = mode == VEHICLE || mode == AIRCRAFT;
+    let (left_x, left_y) = if mode == AIRCRAFT {
+        // Roll and pitch: arrows or numpad 4/6 and 8/2.
+        (either(0x27, 0x66) - either(0x25, 0x64), either(0x26, 0x68) - either(0x28, 0x62))
+    } else {
+        (on(b'D') - on(b'A'), on(b'W') - on(b'S'))
+    };
     PadState {
         buttons,
-        left_trigger: if driving { on(b'S') } else if pc_style { 0.0 } else { on(b'Z') },
-        right_trigger: if driving { on(b'W') } else if pc_style { 0.0 } else { on(b'C') },
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
+        left_trigger: if throttle { on(b'S') } else if pc_style { 0.0 } else { on(b'Z') },
+        right_trigger: if throttle { on(b'W') } else if pc_style { 0.0 } else { on(b'C') },
+        left_x,
+        left_y,
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
     }
@@ -2185,15 +2209,27 @@ mod tests {
     fn driving_keys_press_the_triggers_and_space_is_the_handbrake() {
         let key = |vk: u8| KeyState { virtual_key: vk, ..Default::default() };
         let keys = [key(b'W'), key(0x20)];
-        let on_foot = fallback_with(&keys, true, false);
+        let on_foot = fallback_with(&keys, true, ON_FOOT);
         assert_eq!((on_foot.left_y, on_foot.right_trigger), (1.0, 0.0));
         assert_ne!(on_foot.buttons & X, 0, "Space jumps on foot");
-        let driving = fallback_with(&keys, true, true);
+        let driving = fallback_with(&keys, true, VEHICLE);
         assert_eq!((driving.left_y, driving.right_trigger, driving.left_trigger), (1.0, 1.0, 0.0));
         assert_eq!(driving.buttons & X, 0, "Space is not jump while driving");
         assert_ne!(driving.buttons & RIGHT_SHOULDER, 0, "Space is the handbrake");
-        let brake = fallback_with(&[key(b'S')], true, true);
+        let brake = fallback_with(&[key(b'S')], true, VEHICLE);
         assert_eq!((brake.left_y, brake.left_trigger), (-1.0, 1.0));
+    }
+
+    #[test]
+    fn aircraft_keys_throttle_yaw_and_fly_with_the_arrows() {
+        let key = |vk: u8| KeyState { virtual_key: vk, ..Default::default() };
+        let pad = fallback_with(&[key(b'W'), key(b'A'), key(0x26), key(0x66)], true, AIRCRAFT);
+        assert_eq!((pad.right_trigger, pad.left_y, pad.left_x), (1.0, 1.0, 1.0));
+        assert_ne!(pad.buttons & LEFT_SHOULDER, 0, "A yaws left");
+        assert_eq!(pad.buttons & UP, 0, "the up arrow pitches, it is no D-pad");
+        let slow = fallback_with(&[key(b'S'), key(b'D')], true, AIRCRAFT);
+        assert_eq!((slow.left_trigger, slow.left_y, slow.left_x), (1.0, 0.0, 0.0));
+        assert_ne!(slow.buttons & RIGHT_SHOULDER, 0, "D yaws right");
     }
 
     #[test]
