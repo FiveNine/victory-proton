@@ -99,6 +99,13 @@ const AGAIN: u64 = 8;
 /// From a root view; from one that is written (a structure being built).
 const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
+
+/// What is readied from a view the builder writes (a structure being
+/// built): [`BUILT`], or `VICTORY_BUILT_MB`.
+fn built() -> u64 {
+    static SET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_BUILT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(BUILT, |mb| mb << 20))
+}
 /// The biggest title buffer whose builder results come back.
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
@@ -129,6 +136,23 @@ fn fault_budget() -> usize {
 
 /// Pages given back from probation that are remembered, at most.
 const GHOSTS: usize = 1 << 16;
+
+/// Pages that keep faulting: past [`FAULTS_ALL`] a page is still taken once
+/// it has faulted in [`persist`]`.0` frames, up to `.1` such pages. Most
+/// faults are pages a garbage pointer reached once (58,104 pages faulted by
+/// programs that trace rays in 130 s, 8,075 of them in ten frames or more,
+/// run fl); the cap in all went on those in the first seconds, and the
+/// pages rays read every frame (4,533 of them in 0xe_0000_0000 alone, where
+/// 131 were held) read zeros for the rest of the run.
+/// `VICTORY_FAULT_PERSIST=<frames>,<pages>` (0 frames: off).
+fn persist() -> (u32, usize) {
+    static SET: std::sync::OnceLock<(u32, usize)> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_FAULT_PERSIST").unwrap_or_default();
+        let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
+        (n.next().flatten().unwrap_or(3) as u32, n.next().flatten().unwrap_or(16384))
+    })
+}
 
 /// Frames a page given back waits before its place holds another: lists
 /// recorded with the old entry may still be on their way.
@@ -224,6 +248,10 @@ struct Memory {
     evicted: u64,
     /// Faults (frame, page with marks) for `VICTORY_FAULT_LIST`.
     fault_log: Vec<(u64, u32)>,
+    /// Pages that faulted: the frames they did in, and the last.
+    fault_seen: HashMap<u64, (u32, u64)>,
+    /// Pages taken for faulting in several frames.
+    persisted: usize,
     /// Structures whose compacted size the builder was asked for: where the
     /// size goes ([`Memory::size_of_copy`]).
     size_slots: HashMap<u64, u64>,
@@ -321,6 +349,8 @@ impl Memory {
             evicted: 0,
             fault_log: Vec::new(),
             size_slots: HashMap::new(),
+            fault_seen: HashMap::new(),
+            persisted: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -770,9 +800,23 @@ impl Memory {
             // has a hole until it is written again. Those pages are few
             // (1,628 in 130 s, run fl) and taken past the cap in all.
             let stored = stores.contains(&page);
-            if made >= frame_cap || (budget == 0 && self.faulted >= all_cap && !stored) || self.copy_of(page).is_some() {
+            let (frames, most) = persist();
+            let seen = {
+                if self.fault_seen.len() > 1 << 20 {
+                    self.fault_seen.retain(|_, s| s.0 >= 2);
+                }
+                let frame = self.frame;
+                let e = self.fault_seen.entry(page).or_insert((0, u64::MAX));
+                if e.1 != frame {
+                    *e = (e.0 + 1, frame);
+                }
+                e.0
+            };
+            let kept = frames > 0 && seen >= frames && self.persisted < most;
+            if made >= frame_cap || (budget == 0 && self.faulted >= all_cap && !stored && !kept) || self.copy_of(page).is_some() {
                 continue;
             }
+            let past_cap = budget == 0 && self.faulted >= all_cap && !stored;
             let again = budget > 0 && self.ghosts.remove(&page);
             if budget > 0 {
                 let probation = (budget / 4).max(1);
@@ -785,6 +829,9 @@ impl Memory {
             if self.map(page) {
                 made += 1;
                 self.faulted += 1;
+                if past_cap {
+                    self.persisted += 1;
+                }
                 if budget > 0 && self.pages.contains_key(&page) {
                     if again { self.fault_kept.push_back(page) } else { self.fault_pages.push_back(page) }
                 }
@@ -936,7 +983,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} for faulting in several frames, {} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -959,6 +1006,7 @@ impl Memory {
             s.came[2],
             s.came[3],
             self.faulted,
+            self.persisted,
             self.fault_pages.len() + self.fault_kept.len(),
             self.evicted,
             s.kinds[0] as f64 / frames,
@@ -1210,7 +1258,7 @@ pub(crate) fn ready(
                     (built.1, built.2) = (frame, built.2 + 1);
                 }
                 let before = held(m);
-                m.ready(at, BUILT);
+                m.ready(at, built());
                 came[1] += held(m).saturating_sub(before);
             }
         }
