@@ -124,13 +124,19 @@ fn faults_all() -> usize {
 /// those in the first seconds, and the pages rays read every frame read
 /// zeros for the rest of the run: structures with holes, and ray-traced
 /// light that pulsed from frame to frame indoors.
-/// `VICTORY_FAULT_PERSIST=<frames>,<pages>` (0 frames: off).
+/// `VICTORY_FAULT_PERSIST=<frames>,<pages>` (unset or 0 frames: off).
+///
+/// Off by default: with ray tracing's light band (`VICTORY_AMBIENT_RT`) the
+/// room looked better without it, and its 16,384 pages (1 GB more of title
+/// memory and card memory) pushed the PC into swap: frames over 100 ms 8.5%
+/// against 2.4%, the worst 2,052 against 727 ms (2026-11-28). `3,16384` was
+/// the old default.
 fn persist() -> (u32, usize) {
     static SET: std::sync::OnceLock<(u32, usize)> = std::sync::OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_FAULT_PERSIST").unwrap_or_default();
         let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
-        (n.next().flatten().unwrap_or(3) as u32, n.next().flatten().unwrap_or(16384))
+        (n.next().flatten().unwrap_or(0) as u32, n.next().flatten().unwrap_or(16384))
     })
 }
 
@@ -209,6 +215,10 @@ struct Memory {
     size_slots: HashMap<u64, u64>,
     /// Copies of structures over 4 MiB readied whole.
     copies_sized: u64,
+    /// Microseconds readying them, and the longest once, since the last line.
+    sized_us: (u64, u64),
+    /// Microseconds taking faults, and the longest once, since the last line.
+    faults_us: (u64, u64),
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -297,6 +307,8 @@ impl Memory {
             stored: 0,
             size_slots: HashMap::new(),
             copies_sized: 0,
+            sized_us: (0, 0),
+            faults_us: (0, 0),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -917,10 +929,23 @@ impl Memory {
             persisted = self.persisted,
             stored = self.stored,
             copies_sized = self.copies_sized,
+            sized_ms = self.sized_us.0 as f64 / 1000.0,
+            sized_longest_ms = self.sized_us.1 as f64 / 1000.0,
+            faults_ms = self.faults_us.0 as f64 / 1000.0,
+            faults_longest_ms = self.faults_us.1 as f64 / 1000.0,
             "title memory by address: pages taken past the cap in all (for faulting in several frames, for a dropped store); big structures' copies readied whole"
         );
+        self.sized_us = (0, 0);
+        self.faults_us = (0, 0);
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// Whether a structure over 4 MiB that the builder compacts is readied whole
+/// ([`Memory::size_of_copy`]; `VICTORY_BVH_COPY_WHOLE=0`: not).
+fn copy_whole() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_COPY_WHOLE").is_none_or(|v| v != "0"))
 }
 
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
@@ -1051,7 +1076,10 @@ pub(crate) fn ready(
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        let started = std::time::Instant::now();
         m.take_faults();
+        let us = started.elapsed().as_micros() as u64;
+        m.faults_us = (m.faults_us.0 + us, m.faults_us.1.max(us));
         m.look_again();
         m.report();
         #[cfg(feature = "diagnostics")]
@@ -1078,12 +1106,16 @@ pub(crate) fn ready(
     if builds
         && threads == Some([32, 1, 1])
         && let [from, to] = *written
+        && copy_whole()
         && let Some(len) = m.size_of_copy(from)
         && list.first_use(usize::MAX - (6 << 33) - (to >> 2 & 0x7FFF_FFFF) as usize)
     {
+        let started = std::time::Instant::now();
         m.ready(from, len);
         m.ready(to, len);
         m.copies_sized += 1;
+        let us = started.elapsed().as_micros() as u64;
+        m.sized_us = (m.sized_us.0 + us, m.sized_us.1.max(us));
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
