@@ -295,6 +295,13 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
         .min()
 }
 
+/// `VICTORY_DYNAMIC_STRIDES=1`: dynamic slots get their stride and kind
+/// words too ([`HostHeap::write_stride`]).
+fn dynamic_strides() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_STRIDES").is_some_and(|v| v == "1"))
+}
+
 /// Whether the slots of texture objects are made again with those of
 /// placed views of their memory ([`Spans::objects`];
 /// `VICTORY_OBJECT_SLOTS=0`: only the placed views', as before).
@@ -3104,6 +3111,13 @@ impl HostHeap {
     /// the host's [`victory_shader::emit::SLOT_STRIDES`] table.
     #[inline]
     fn write_stride(&self, index: u32, word: u32) {
+        // Dynamic slots (draws' tables) only with `VICTORY_DYNAMIC_STRIDES=1`:
+        // the facial solver then reads its integer views as such, and on an
+        // AMD card the faces come out torn (holes at the nose, the jaw
+        // stretched; runs n1, f1, c1), where a still mouth is whole.
+        if index >= self.count && !dynamic_strides() {
+            return;
+        }
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
