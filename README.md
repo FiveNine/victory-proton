@@ -8,6 +8,12 @@ Built on [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900
 (its original README: [docs/README-7900XTX-fork.md](docs/README-7900XTX-fork.md)),
 with the changes Linux needed and a much faster ray-tracing path.
 
+Since 2026-11-27 the runtime is a faster tree tuned for Linux under Proton on
+the RX 9070 XT: the info panel (`VICTORY_PANEL=1`, F3), a launcher and S70 preset
+runs (`linux/launcher.sh`, `linux/s70.sh`), FSR 4 and frame generation with AMD's
+FidelityFX DLLs in `linux/keep/fidelityfx/`. The tree before it is on the
+`linux-proton` branch.
+
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
