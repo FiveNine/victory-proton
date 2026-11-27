@@ -191,6 +191,16 @@ fn fault_caps() -> (usize, usize) {
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
+/// [`SWEEP`], or `VICTORY_BVH_SWEEP=<frames>`.
+fn sweep() -> usize {
+    static SET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let n = std::env::var("VICTORY_BVH_SWEEP").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(SWEEP);
+        tracing::info!(frames = n, "title memory by address: every held page looked at again over so many frames");
+        n
+    })
+}
+
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
@@ -311,6 +321,14 @@ struct Stats {
     in_window: u64,
     /// Copies of structures over 4 MiB readied whole.
     copies_sized: u64,
+    /// Microseconds of the once-a-frame work, and of its sweep.
+    frame_us: u64,
+    sweep_us: u64,
+    sweep_pages_us: u64,
+    /// The mutex: calls, microseconds waited for it, held.
+    lock_calls: u64,
+    lock_wait: u64,
+    lock_held: u64,
     /// Pages that keep faulting given a window's copy.
     from_windows: u64,
 }
@@ -557,7 +575,8 @@ impl Memory {
 
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
-        for _ in 0..self.order.len().div_ceil(SWEEP) {
+        let began = std::time::Instant::now();
+        for _ in 0..self.order.len().div_ceil(sweep()) {
             self.sweep = (self.sweep + 1) % self.order.len();
             let page = self.order[self.sweep];
             if self.pages.contains_key(&page) {
@@ -569,7 +588,8 @@ impl Memory {
                 }
             }
         }
-        for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
+        self.stats.sweep_pages_us += began.elapsed().as_micros() as u64;
+        for _ in 0..self.packed_order.len().div_ceil(sweep()) {
             self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
             let address = self.packed_order[self.packed_sweep];
             if !self.packed.contains_key(&address) {
@@ -1040,7 +1060,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} for faulting in several frames, {} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole; {} pages from windows",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} ({} for faulting in several frames, {} held, {} given back); faults per frame by what found them: {:.1} loads, {:.1} loads tracing rays, {:.1} stores, {:.1} stores tracing rays; {:.1} on pages a window holds; {} big structures' copies readied whole; {} pages from windows; the mutex per frame: {:.0} calls, {:.2} ms waited for (all threads), {:.2} ms held, of it {:.2} ms the frame's faults and sweep ({:.2} the sweep, {:.2} of it its pages)",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -1072,7 +1092,13 @@ impl Memory {
             s.kinds[3] as f64 / frames,
             s.in_window as f64 / frames,
             s.copies_sized,
-            s.from_windows
+            s.from_windows,
+            s.lock_calls as f64 / frames,
+            s.lock_wait as f64 / 1000.0 / frames,
+            s.lock_held as f64 / 1000.0 / frames,
+            s.frame_us as f64 / 1000.0 / frames,
+            s.sweep_us as f64 / 1000.0 / frames,
+            s.sweep_pages_us as f64 / 1000.0 / frames
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -1197,17 +1223,26 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
+    let asked = std::time::Instant::now();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let got = std::time::Instant::now();
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    m.stats.lock_wait += (got - asked).as_micros() as u64;
+    m.stats.lock_calls += 1;
+    let _timer = HeldTimer(got, &raw mut m.stats.lock_held);
     let frame = crate::frame::current();
     if m.frame != frame {
+        let began = std::time::Instant::now();
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        let swept = std::time::Instant::now();
         m.look_again();
+        m.stats.sweep_us += swept.elapsed().as_micros() as u64;
+        m.stats.frame_us += began.elapsed().as_micros() as u64;
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
@@ -1382,6 +1417,17 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// Adds the time since it was made to the counter it points at, when it
+/// goes (under the memory's mutex, which outlives it).
+struct HeldTimer(std::time::Instant, *mut u64);
+impl Drop for HeldTimer {
+    fn drop(&mut self) {
+        // SAFETY: the counter lives in the memory behind the mutex the
+        // caller still holds.
+        unsafe { *self.1 += self.0.elapsed().as_micros() as u64 };
+    }
 }
 
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
