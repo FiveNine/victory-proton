@@ -54,7 +54,15 @@ else
     # 6 ms a frame there (19.5 against 22.2 fps): =0 for the speed without it.
     extra+=(VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_CARD_STEPS_LEARN="${VICTORY_CARD_STEPS_LEARN:-1}")
 fi
-[ "${RT:-0}" = 1 ] && extra+=(VICTORY_BVH_BUILDER=1)
+# With ray tracing the traced indirect light is held between 1.2 and 3 times
+# the stand-in's estimate (VICTORY_AMBIENT_RT; empty: the title's own). Some of
+# the structures the rays walk are wrong, and indoors the light swung between
+# lit and black walls every few seconds: frame-to-frame change 4.8 against 0.9
+# with the band (2026-11-27, Jason's house, couch). VICTORY_AMBIENT scales it.
+if [ "${RT:-0}" = 1 ]; then
+    extra+=(VICTORY_BVH_BUILDER=1)
+    [ -n "${VICTORY_AMBIENT_RT-1.2,3}" ] && extra+=(VICTORY_AMBIENT_RT="${VICTORY_AMBIENT_RT-1.2,3}")
+fi
 # PATCHED=1 (default): our copy of Proton Experimental whose wineserver finds
 # views by address (keep/wineserver-view-tree.patch); PATCHED=0: Steam's own.
 if [ "${PATCHED:-1}" = 1 ] && [ -x "$PWD/proton-patched/files/bin/wineserver" ]; then
