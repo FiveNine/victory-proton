@@ -5620,10 +5620,13 @@ pub(crate) fn window_over(start: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 /// Whether asks that may take any window take one that holds them on the
-/// default grid too ([`loose`]; `VICTORY_WINDOW_SHARE=0`: not, as before).
+/// default grid too ([`loose`]; `VICTORY_WINDOW_SHARE=1`; off by default).
+/// On belo-amd's tree (runs b0/b1, one each) it made windows 7.7 GB against
+/// 6.6 and the frame rate 11.4 against 17.7; the 8.0 -> 6.9 GB of runs g1
+/// and ws3 here is within what windows vary from run to run.
 fn share() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_SHARE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_SHARE").is_some_and(|v| v == "1"))
 }
 
 /// How far below an ask's cell a window that holds it may begin.
