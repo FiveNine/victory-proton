@@ -1609,6 +1609,10 @@ impl State {
             }
             // The host's own ([`Self::host_word`]): no root argument.
             (_, RootType::Other(_)) => 0,
+            // A heap's own address: offset 0 of the bound heap, as tables
+            // are given (a program of the console path that indexes the
+            // heap, `victory_shader::native::fspx_program`).
+            (_, RootType::ResourceHeap | RootType::SamplerHeap) => 0,
             _ => {
                 once!(
                     slot,
@@ -1637,6 +1641,23 @@ impl State {
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
+        }
+        // The bound heaps' starts and sizes, for descriptors the shader
+        // loads by address (`victory_shader::emit::USER_HEAP_START`): dwords
+        // 0-1 the view heap's start, 2-3 the sampler heap's, 4 and 5 their
+        // counts.
+        if kind == victory_shader::emit::USER_HEAP_START {
+            let samplers = matches!(dword, 2 | 3 | 5);
+            let h = self.heaps[usize::from(samplers)];
+            if h == 0 {
+                return 0;
+            }
+            let heap = crate::descriptor::heap(h as This);
+            return match dword {
+                0 | 2 => heap.start as u32,
+                1 | 3 => (heap.start >> 32) as u32,
+                _ => heap.count(),
+            };
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {

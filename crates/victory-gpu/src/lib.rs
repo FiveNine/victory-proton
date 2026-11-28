@@ -100,6 +100,8 @@ mod shadow;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod slottrap;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod clockscan;
+#[cfg(all(windows, feature = "diagnostics"))]
 pub mod physmap;
 #[cfg(windows)]
 mod tiles;

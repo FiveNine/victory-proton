@@ -1386,6 +1386,8 @@ pub(crate) fn ready(
         #[cfg(feature = "diagnostics")]
         crate::slottrap::frame();
         #[cfg(feature = "diagnostics")]
+        crate::clockscan::frame(frame);
+        #[cfg(feature = "diagnostics")]
         m.stages_look(frame);
     }
     #[cfg(feature = "diagnostics")]

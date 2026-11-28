@@ -103,6 +103,13 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of user-data dwords the host computes: the title
+/// address the bound view heap starts at (`dword` 0 low, 1 high), the
+/// sampler heap's (2, 3), and how many descriptors each holds (4 views, 5
+/// samplers). Console code loads descriptors through addresses it reads
+/// from memory (bindless tables): the shader makes the heap index from
+/// the address (`lower.rs` `memory_heap_index`).
+pub const USER_HEAP_START: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

@@ -2449,7 +2449,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
+        for d in [a.dynamic, a.dynamic2].into_iter().flatten() {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
@@ -3133,6 +3133,12 @@ impl<'a> Lower<'a> {
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // No wave overlaps this one (see `ordered_section`).
                     None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
+                    // VCC on entry: undefined on the hardware too, so read
+                    // only on paths that seem to allow it (now that VCC can
+                    // be parked in a lane, `ir::unspill`).
+                    None if matches!(n, 106 | 107) => Val::I32(self.s.m.i32(0)),
+                    None if n == 124 => Val::Missing("a hardware SGPR input (M0)"),
+                    None if n >= 126 => Val::Missing("a hardware SGPR input (EXEC or above)"),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -6882,6 +6888,25 @@ impl<'a> Lower<'a> {
                 };
                 (self.s.m.bin(c, op, a, b), None)
             }
+            // Two 16-bit halves into one dword: the low or high half of
+            // S0 into bits 0-15, of S1 into bits 16-31 (`ll`, `lh`, `hh`;
+            // 115 of the programs of the console path, run fspx1).
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let half = |me: &mut Self, x, high: bool| {
+                    if high {
+                        me.s.m.bin(c, Bin::LShr, x, k16)
+                    } else {
+                        me.s.m.bin(c, Bin::And, x, low)
+                    }
+                };
+                let bytes = name.as_bytes();
+                let lo = half(self, a, bytes[7] == b'h');
+                let hi = half(self, b, bytes[8] == b'h');
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                (self.s.m.bin(c, Bin::Or, lo, hi), None)
+            }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
@@ -6898,6 +6923,15 @@ impl<'a> Lower<'a> {
                 };
                 let t = self.s.m.cmp(c, p, a, b);
                 (self.s.m.select(c, t, a, b), None)
+            }
+            "s_absdiff_i32" => {
+                // |S0 - S1| (SCC: whether it is not 0).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let d = self.s.m.bin(c, Bin::Sub, a, b);
+                let z = self.s.m.i32(0);
+                let neg = self.s.m.cmp(c, pred::SLT, d, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, d);
+                (self.s.m.select(c, neg, n, d), None)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -7763,6 +7797,10 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar load from the code"),
         };
         let c = self.cur;
+        // (A scalar load has one offset register: no second term.)
+        if a.dynamic2.is_some() {
+            return Err("an address with two computed terms");
+        }
         let mut addr = self.s.m.i32(a.offset);
         if let Some(value) = a.dynamic {
             let mut d = self.i32_of(value)?;
@@ -8207,6 +8245,13 @@ impl<'a> Lower<'a> {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
                 };
+                if let Some(v) = address.dynamic2 {
+                    let v = self.i32_of(v)?;
+                    x = Some(match x {
+                        Some(d) => self.s.m.bin(self.cur, Bin::Add, d, v),
+                        None => v,
+                    });
+                }
                 if let Some(bias) = self.root_bias(address.param) {
                     x = Some(match x {
                         Some(d) => self.s.m.bin(self.cur, Bin::Add, d, bias),
@@ -8691,11 +8736,14 @@ impl<'a> Lower<'a> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
-        let heap = self
-            .scalar
-            .get(load)
-            .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap || (tables && p.root == RootType::Table));
+        // (Also a descriptor loaded by address: a slot of the bound heap,
+        // `memory_heap_index`.)
+        let heap = self.scalar.get(load).is_some_and(|a| a.param == MEMORY)
+            || self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap || (tables && p.root == RootType::Table));
         if !heap {
             return Ok(None);
         }
@@ -8803,9 +8851,17 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
+        // Loaded from title memory by an address the code computed (a
+        // bindless table): the heap index from the address and the bound
+        // heap's start ([`Self::memory_heap_index`]).
+        let memory = a.param == MEMORY;
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
-            _ => return Err("a descriptor outside the heaps"),
+            _ if memory => {}
+            Some(RootType::Descriptor) => return Err("a descriptor outside the heaps (a root descriptor's memory)"),
+            Some(_) => return Err("a descriptor outside the heaps (another root parameter)"),
+            None if a.param == CODE => return Err("a descriptor outside the heaps (the code)"),
+            None => return Err("a descriptor outside the heaps"),
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
@@ -8831,9 +8887,49 @@ impl<'a> Lower<'a> {
             .s
             .m
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
+        let low = at;
         at = self.s.m.bin(c, Bin::Add, at, k);
+        if memory {
+            // The high dword: the SGPR base's, or the VGPR pair's.
+            let hi = match saddr {
+                Some(Operand::Scalar { code, .. }) if code != NULL => li.read(Reg::S(code + 1)).ok_or(WHY)?,
+                _ => li.read(Reg::V(reg + 1)).ok_or(WHY)?,
+            };
+            let hi = self.i32_of(hi)?;
+            return Ok(self.memory_heap_index(low, at, hi, sampler));
+        }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+    }
+
+    /// The heap index of a descriptor at a title address (`lo`, `hi`; `was`
+    /// the low dword before the last additions, for their carry): the
+    /// address less the start of the bound view or sampler heap, over the
+    /// descriptor's size (`USER_HEAP_START`). An address outside that heap
+    /// reads slot 0.
+    fn memory_heap_index(&mut self, was: V, lo: V, hi: V, sampler: bool) -> V {
+        use super::shader::USER_HEAP_START;
+        let c = self.cur;
+        let pick = if sampler { 2 } else { 0 };
+        let start_lo = self.host_word(RootType::Other(USER_HEAP_START), 0, pick);
+        let start_hi = self.host_word(RootType::Other(USER_HEAP_START), 0, pick + 1);
+        let count = self.host_word(RootType::Other(USER_HEAP_START), 0, 4 + pick / 2);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        // The carry of the additions into the high dword.
+        let carried = self.s.m.cmp(c, pred::IULT, lo, was);
+        let carry = self.s.m.select(c, carried, one, zero);
+        let hi = self.s.m.bin(c, Bin::Add, hi, carry);
+        let dlo = self.s.m.bin(c, Bin::Sub, lo, start_lo);
+        let borrowed = self.s.m.cmp(c, pred::IULT, lo, start_lo);
+        let borrow = self.s.m.select(c, borrowed, one, zero);
+        let dhi = self.s.m.bin(c, Bin::Sub, hi, start_hi);
+        let dhi = self.s.m.bin(c, Bin::Sub, dhi, borrow);
+        let shift = self.s.m.i32(if sampler { 4 } else { 5 });
+        let index = self.s.m.bin(c, Bin::LShr, dlo, shift);
+        let inside_hi = self.s.m.cmp(c, pred::EQ, dhi, zero);
+        let inside = self.s.m.cmp(c, pred::IULT, index, count);
+        let index = self.s.m.select(c, inside, index, zero);
+        self.s.m.select(c, inside_hi, index, zero)
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -8843,9 +8939,17 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
+        // Loaded from title memory by an address the code computed (a
+        // bindless table): the heap index from the address and the bound
+        // heap's start ([`Self::memory_heap_index`]).
+        let memory = a.param == MEMORY;
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
-            _ => return Err("a descriptor outside the heaps"),
+            _ if memory => {}
+            Some(RootType::Descriptor) => return Err("a descriptor outside the heaps (a root descriptor's memory)"),
+            Some(_) => return Err("a descriptor outside the heaps (another root parameter)"),
+            None if a.param == CODE => return Err("a descriptor outside the heaps (the code)"),
+            None => return Err("a descriptor outside the heaps"),
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
@@ -8863,6 +8967,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let base = li.read(Reg::S(code)).ok_or("a descriptor load")?;
         let mut addr = self.i32_of(base)?;
+        let low = addr;
         let k = self
             .s
             .m
@@ -8871,6 +8976,11 @@ impl<'a> Lower<'a> {
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(li, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
+        }
+        if memory {
+            let hi = li.read(Reg::S(code + 1)).ok_or("a descriptor load")?;
+            let hi = self.i32_of(hi)?;
+            return Ok(self.memory_heap_index(low, addr, hi, sampler));
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
@@ -11085,6 +11195,18 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
             }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                // The low halves multiplied (zero- or sign-extended), plus
+                // the third operand.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (sh, op) = (k(self, 16), if name == "v_mad_i32_i16" { Bin::AShr } else { Bin::LShr });
+                let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                let a = self.s.m.bin(c, op, a, sh);
+                let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                let b = self.s.m.bin(c, op, b, sh);
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let (sh, op) = (
@@ -12062,8 +12184,8 @@ impl<'a> Lower<'a> {
             // float format (the console converts by the view's format).
             // One channel goes into a view the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask != 0xF && !counter {
-                return Err("an image store of some channels");
+            if *dmask == 0 {
+                return Err("an image store of no channel");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -12102,10 +12224,23 @@ impl<'a> Lower<'a> {
                 return Ok(());
             }
             let mut vals = Vec::new();
+            // The channels `dmask` names are packed into consecutive VGPRs
+            // (d16: two to a VGPR); each goes to its own channel, the
+            // others take 0 (the console compiler names a view format's own
+            // channels: 195 programs of the console path stored one to
+            // three, run fspx1).
+            let mut packed = 0u8;
             for k in 0..4u8 {
+                if *dmask & (1 << k) == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                let n = packed;
+                packed += 1;
                 // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                let r = if *d16 { n / 2 } else { n };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                let k = n;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
@@ -12728,6 +12863,35 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The byte an index into a buffer of a stride the program's metadata
+    /// does not give reaches: index times the stride the descriptor holds
+    /// (dword 1, bits 16-29; descriptors loaded by address or remade by the
+    /// code have no metadata entry), plus `off`. The access then goes
+    /// through the buffer's raw view. (124 programs of the console path,
+    /// run fspx1.)
+    fn runtime_stride_byte(&mut self, inst: &Inst, src: &Source, index: V, off: V) -> Result<V, Why> {
+        const WHY: Why = "a structured buffer of unknown stride";
+        // The host's table by heap slot first (it holds the words of the
+        // slots tables are copied into as well).
+        if let Some(word) = self.slot_word(src, true)? {
+            let c = self.cur;
+            let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
+            let stride = self.s.m.bin(c, Bin::And, word, bits);
+            let at = self.s.m.bin(c, Bin::Mul, index, stride);
+            return Ok(self.s.m.bin(c, Bin::Add, at, off));
+        }
+        let Fields::Buffer { rsrc, .. } = &inst.fields else { return Err(WHY) };
+        let Operand::Scalar { code, .. } = *rsrc else { return Err(WHY) };
+        let w1 = inst.read(Reg::S(code + 1)).ok_or(WHY)?;
+        let w1 = self.i32_of(w1).map_err(|_| WHY)?;
+        let c = self.cur;
+        let (k16, mask) = (self.s.m.i32(16), self.s.m.i32(0x3FFF));
+        let stride = self.s.m.bin(c, Bin::LShr, w1, k16);
+        let stride = self.s.m.bin(c, Bin::And, stride, mask);
+        let at = self.s.m.bin(c, Bin::Mul, index, stride);
+        Ok(self.s.m.bin(c, Bin::Add, at, off))
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.root_copy = None;
         let Fields::Buffer {
@@ -13037,10 +13201,12 @@ impl<'a> Lower<'a> {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                        let byte = self.runtime_stride_byte(inst, src, index, off)?;
+                        (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    } else {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        (h, [index, off, iu])
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -13123,10 +13289,15 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to write a float format;
+                // fewer than four channels (the format's own) are padded
+                // with 0, which the view's format drops (56 programs of the
+                // console path, run fspx1).
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
+                }
+                while vals.len() < 4 {
+                    vals.push(self.s.m.i32(0));
                 }
                 // Four unsigned integers for halves, four floats otherwise.
                 let component = if halves { 0x405 } else { 0x409 };
@@ -13154,10 +13325,13 @@ impl<'a> Lower<'a> {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
+                            let byte = self.runtime_stride_byte(inst, src, index, off)?;
+                            args.push(self.handle(site, src, false, (11 | u, 0))?);
+                            args.extend([byte, iu]);
+                        } else {
+                            args.push(self.handle(site, src, false, (12 | u, stride))?);
+                            args.extend([index, off]);
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -13284,17 +13458,27 @@ impl<'a> Lower<'a> {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                        let byte = self.runtime_stride_byte(inst, src, index, off)?;
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, byte, iu, mask, align],
+                        )
+                    } else {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;

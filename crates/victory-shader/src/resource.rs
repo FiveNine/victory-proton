@@ -21,8 +21,9 @@ use crate::structure::{Bool, LaneExit, Meets, Structured};
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
-/// A byte address: a root parameter's, plus a constant and at most one
-/// value the program computes (an index times a stride, say).
+/// A byte address: a root parameter's, plus a constant and at most two
+/// values the program computes (an index times a stride, say, and the
+/// instruction's own offset register).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
     /// Index into the layout, or [`CODE`].
@@ -31,6 +32,12 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// A second computed term, added too: an address whose 64-bit base
+    /// already holds one (the program added an index into the root
+    /// address) read with an offset register that holds another. 407 of
+    /// the 744 programs of the console path that did not translate were
+    /// such (run fspx1, 2026-11-28).
+    pub dynamic2: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -514,10 +521,14 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
-                            Some(Moved::Const(c)) => Some(Term::Const(c)),
-                            Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
+                        let xored = self.xor_copy(&o, inst, k);
+                        let new = match xored {
+                            Some(t) => Some(t),
+                            None => match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                                Some(Moved::Const(c)) => Some(Term::Const(c)),
+                                Some(Moved::Value(s)) => o[s.0 as usize],
+                                None => Some(Term::Value(v)),
+                            },
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -538,6 +549,68 @@ impl<'a> Tracer<'a> {
             offset: 0,
             what: "copies that do not settle",
         })
+    }
+
+    /// Dword `k` of an `s_xor_b32`/`s_xor_b64` that comes down to a copy:
+    /// the console compiler exchanges registers without a third one
+    /// (`a ^= b; b ^= a; a ^= b`), so a descriptor's dword arrived through
+    /// three XORs and looked computed (95 of the 744 programs of the
+    /// console path that did not translate, run fspx1, 2026-11-28). The
+    /// XORs (up to four deep) are opened into the origins they combine;
+    /// pairs cancel, and one left over is the copy. `None` if it is no copy
+    /// or an origin is not known yet.
+    fn xor_copy(&self, o: &[Option<Term>], inst: &Inst, k: usize) -> Option<Term> {
+        fn open(t: &Tracer<'_>, o: &[Option<Term>], inst: &Inst, k: usize, depth: u32, out: &mut Vec<Term>) -> Option<()> {
+            let dwords = match inst.name() {
+                "s_xor_b32" => 1,
+                "s_xor_b64" => 2,
+                _ => return None,
+            };
+            if k >= dwords {
+                return None;
+            }
+            let Fields::Sop { src, .. } = &inst.fields else { return None };
+            for op in src.iter().take(2) {
+                match *op {
+                    Operand::Scalar { code: NULL, .. } => {}
+                    Operand::Scalar { code, .. } => {
+                        let v = inst.read(Reg::S(code + k as u8))?;
+                        let def = t.def(v);
+                        let inner = def.filter(|d| depth > 0 && matches!(d.name(), "s_xor_b32" | "s_xor_b64"));
+                        match inner {
+                            Some(d) => {
+                                let k2 = d.writes.iter().position(|w| w.1 == v)?;
+                                open(t, o, d, k2, depth - 1, out)?;
+                            }
+                            None => out.push(o[v.0 as usize]?),
+                        }
+                    }
+                    Operand::Const(c) if inline(c) == Some(0) => {}
+                    _ => return None,
+                }
+            }
+            Some(())
+        }
+        if !matches!(inst.name(), "s_xor_b32" | "s_xor_b64") {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        open(self, o, inst, k, 4, &mut leaves)?;
+        // Pairs cancel.
+        let mut left: Vec<Term> = Vec::new();
+        for t in leaves {
+            match left.iter().position(|&x| x == t) {
+                Some(i) => {
+                    left.swap_remove(i);
+                }
+                None => left.push(t),
+            }
+        }
+        match left[..] {
+            [t] => Some(t),
+            [] => Some(Term::Const(0)),
+            _ => None,
+        }
     }
 
     /// Whether some lane can satisfy all of `conditions` ([`Bools::meet`]).
@@ -881,6 +954,7 @@ impl<'a> Tracer<'a> {
                 param: MEMORY,
                 offset: 0,
                 dynamic: None,
+                dynamic2: None,
             })
         } else {
             Err(why)
@@ -945,9 +1019,9 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
-        if s.dynamic.is_some() && extra.dynamic.is_some() {
-            return Err("an address with two computed terms");
-        }
+        // Two computed terms: the base's and the instruction's, both added.
+        let dynamic2 = if s.dynamic.is_some() { extra.dynamic } else { None };
+        let extra = Sum { dynamic: if s.dynamic.is_some() { None } else { extra.dynamic }, ..extra };
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -959,10 +1033,14 @@ impl<'a> Tracer<'a> {
             // already: each path's `s_getpc_b64` counts as its own offset.
             let joined = s.dynamic.is_some_and(|d| self.code_join(d).is_some());
             let first = if joined { 0 } else { pc.machine.offset as u32 + 4 };
+            if dynamic2.is_some() {
+                return Err("an address with two computed terms");
+            }
             return Ok(Address {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                dynamic2: None,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -990,6 +1068,7 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            dynamic2,
         })
     }
 
@@ -1181,7 +1260,7 @@ impl<'a> Tracer<'a> {
         {
             return Ok(Source::Constant(consts));
         }
-        if let Some(source) = self.loaded(words) {
+        if let Some(source) = self.loaded(words).or_else(|| self.loaded_as_raw(words)) {
             return Ok(source);
         }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
@@ -2144,6 +2223,65 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// A loaded buffer descriptor the code turns into a raw view of the same
+    /// bytes before using it: dword 0 as loaded (the base's low half), dword
+    /// 1 masked so that the base's high half (bits 0-15) stays and the
+    /// stride goes, dword 2 (the record count) computed anew, dword 3 the
+    /// loaded one with bits cleared and set (format, out-of-bounds mode).
+    /// 290 of the 744 programs of the console path that did not translate
+    /// made their descriptors so (`s_and_b32 0xc000ffff`, `s_mul_i32` of
+    /// the count, `s_or_b32 0x30000000`; run fspx1, 2026-11-28). The
+    /// buffer is the loaded descriptor's.
+    // shortcut: the record count and the out-of-bounds mode are not kept
+    // (the host's view of the buffer bounds accesses instead).
+    fn loaded_as_raw(&self, words: &[Term]) -> Option<Source> {
+        let [Term::Value(v0), w1, _, w3] = *words else { return None };
+        let load = self.defs[v0.0 as usize]?;
+        let inst = self.inst(load);
+        if !inst.name().starts_with("s_load_") {
+            return None;
+        }
+        let first = inst.writes.iter().position(|w| w.1 == v0)?;
+        let dword = |k: usize| inst.writes.get(first + k).map(|x| Term::Value(x.1));
+        // Through `s_and_b32` and `s_or_b32` with constants to the loaded
+        // dword `k`: the bits kept (AND masks), set (OR).
+        let peel = |mut t: Term, k: usize| -> Option<(u32, u32)> {
+            let (mut kept, mut set) = (u32::MAX, 0u32);
+            for _ in 0..4 {
+                if Some(t) == dword(k) {
+                    return Some((kept, set));
+                }
+                let Term::Value(v) = t else { return None };
+                let (name, [a, b]) = match self.sop2(v, &["s_and_b32", "s_or_b32"]) {
+                    Some((i, ab)) => (i.name(), ab),
+                    None => return None,
+                };
+                let (x, c) = match (a, b) {
+                    (x, Term::Const(c)) | (Term::Const(c), x) => (x, c),
+                    _ => return None,
+                };
+                if name == "s_and_b32" {
+                    kept &= c;
+                    set &= c;
+                } else {
+                    set |= c;
+                }
+                t = x;
+            }
+            None
+        };
+        let (kept1, set1) = peel(w1, 1)?;
+        // The base's high half stays as loaded.
+        if kept1 & 0xffff != 0xffff || set1 & 0xffff != 0 {
+            return None;
+        }
+        peel(w3, 3)?;
+        Some(Source::Loaded {
+            load,
+            first: first as u8,
+        })
+    }
+
     /// A descriptor the code keeps per lane: every dword of `words` is the
     /// first lane (`v_readfirstlane_b32`) of a VGPR that `v_mov_b32` filled
     /// from SGPRs. The console compiler does this to a descriptor loaded on
@@ -2342,9 +2480,8 @@ impl Tracer<'_> {
         if spill_strict() && lane >= if self.p.wave64 { 64 } else { 32 } {
             return None;
         }
-        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
-            .ok()
-            .flatten()
+        let r = self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new());
+        r.ok().flatten()
     }
 
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
@@ -2356,13 +2493,26 @@ impl Tracer<'_> {
             }
             seen.push(v);
             let mut found = None;
+            let mut unsaved = false;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
+                // A path on which the lane holds no save (the VGPR had other
+                // uses before the first save; the console compiler restores
+                // only where it saved): no value from there. 73 programs of
+                // the console path read a parked descriptor through such
+                // joins (run fspx1).
+                match self.spilled(a, lane, seen) {
+                    Ok(Some(m)) => {
+                        if found.is_some_and(|f| f != m) {
+                            return Err(());
+                        }
+                        found = Some(m);
                     }
-                    found = Some(m);
+                    Ok(None) => {}
+                    Err(()) => unsaved = true,
                 }
+            }
+            if unsaved && found.is_none() {
+                return Err(());
             }
             return Ok(found);
         }
@@ -2370,6 +2520,18 @@ impl Tracer<'_> {
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
+        // shortcut: a vector instruction that writes the spill VGPR and
+        // reads its own previous value updates another lane (the console
+        // compiler does so with EXEC down to that lane, lane 31 of a spill
+        // register in the console path's programs): the lane looked for
+        // passes through it.
+        if inst.name() != "v_writelane_b32"
+            && let Some(Operand::Vector { reg, .. }) = w.dst
+            && let Some(old) = inst.read(Reg::V(reg))
+            && w.src.iter().any(|o| matches!(*o, Operand::Vector { reg: r, .. } if r == reg))
+        {
+            return self.spilled(old, lane, seen);
+        }
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
@@ -2424,6 +2586,22 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         let w = constant(src.first()?)? & 31;
         let at = constant(src.get(1)?)? & 31;
         return Some(Moved::Const(((1u32 << w) - 1) << at));
+    }
+    // The same as 64 bits, a dword of it each: the console compiler makes
+    // an immediate sampler's first two dwords so (`s_bfm_b64 s[n:n+1], 2,
+    // 54`): 265 of the 744 programs of the console path that did not
+    // translate took the sampler for a buffer around an unknown address
+    // (run fspx1, 2026-11-28).
+    if inst.name() == "s_bfm_b64" && k < 2 {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let w = constant(src.first()?)? & 63;
+        let at = constant(src.get(1)?)? & 63;
+        let mask = if w == 0 { 0 } else { (u64::MAX >> (64 - w)) << at };
+        return Some(Moved::Const(if k == 0 { mask as u32 } else { (mask >> 32) as u32 }));
     }
     let src = src.first()?;
     match (inst.name(), *src) {
@@ -2508,6 +2686,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            dynamic2: None,
         }
     }
 

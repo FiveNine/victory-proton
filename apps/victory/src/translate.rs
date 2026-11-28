@@ -562,7 +562,19 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    // A panic in the translator is one container's failure, named, not
+    // the whole run's (the console path's programs found emitter bugs).
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        translate_programs(&container, programs, &example, t, checks);
+    }));
+    if let Err(e) = caught {
+        let what = e
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic".to_owned());
+        return t.fail(format!("panic: {what}"), example);
+    }
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -891,6 +903,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         // tables are no root parameter.
         if let Some(a) = a
             && a.param != resource::CODE
+            && a.param != resource::MEMORY
             && !matches!(
                 p.layout[a.param].root,
                 RootType::ResourceHeap | RootType::SamplerHeap

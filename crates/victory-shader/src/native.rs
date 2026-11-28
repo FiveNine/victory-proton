@@ -618,6 +618,24 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         p.sgprs = u32::from(end - p.user_data);
     }
+    // User SGPRs past the last parameter that no record names: the heap
+    // addresses of a program that picks descriptors from the heaps by
+    // index (SM 6.6 dynamic resources), the view heap's first and the
+    // sampler heap's second. The metadata lists only the resources a
+    // program names; the console path's programs load descriptors at
+    // `s6 + index * 32` (run fspx1, 2026-11-28: 74 programs read s6 or s10
+    // with nothing mapped there).
+    let mapped_end = layout.iter().map(|p| u32::from(p.user_data) + p.sgprs).max().unwrap_or(0);
+    for (k, at) in (mapped_end..u32::from(user_sgprs)).take(2).enumerate() {
+        layout.push(RootParam {
+            root: if k == 0 { RootType::ResourceHeap } else { RootType::SamplerHeap },
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: at as u8,
+            slot: 0xF0 + k as u8,
+        });
+    }
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
