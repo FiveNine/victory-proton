@@ -3219,6 +3219,12 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::memory::note_stage(&p.name);
+        }
+        // (Nothing left over from a dispatch that did not get this far.)
+        let _ = crate::memory::refused();
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3226,6 +3232,11 @@ impl State {
             if crate::pipeline::is_builder(self.pipeline as This) {
                 crate::pipeline::builder_rests("one of its dispatches could not be bound");
             }
+            return;
+        }
+        // (A clone from a source that is no structure: `crate::memory`.)
+        if crate::memory::refused() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -3254,6 +3265,31 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         let profiled = if crate::gpuprof::on() { crate::gpuprof::before(&list.list, &format!("dispatch {}", p.name)) } else { None };
+        // A stage of the structure builder reads what the stage before it
+        // stored (the header's offsets, counters in scratch memory), and the
+        // console's own code between them is not a call the host sees: with
+        // no barrier the host card may run two stages at once. A test
+        // switch ([`builder_barrier`]): it was not what leaves structures
+        // without a header. The first dispatch after the builder's waits
+        // for it the same way.
+        static AFTER_BUILDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        let key = std::ptr::from_ref(list) as usize;
+        let follows = AFTER_BUILDER.load(Ordering::Relaxed) == key;
+        if builder_barrier() && (builder || follows) {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            // SAFETY: an open list; a barrier that names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            AFTER_BUILDER.store(if builder { key } else { 0 }, Ordering::Relaxed);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
@@ -5566,4 +5602,11 @@ mod aliased_recheck_tests {
         assert_eq!(next_look(last, false), Some(ALIASED_RECHECK));
         assert_eq!(next_look(last, true), Some(ALIASED_RECHECK));
     }
+}
+
+/// Whether the structure builder's dispatches are kept apart by a barrier
+/// (`VICTORY_BVH_BARRIER=1`; off: a run with it had no more whole structures, 2 of 31 rebuilt every frame against 12 of 33).
+fn builder_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BARRIER").is_some_and(|v| v == "1"))
 }
