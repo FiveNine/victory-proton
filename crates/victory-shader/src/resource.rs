@@ -1049,7 +1049,7 @@ impl<'a> Tracer<'a> {
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
+            RootType::Descriptor | RootType::VertexTable => {
                 let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
                 let input = self.p.inputs.iter().find(|i| i.0 == high);
                 Some(input.ok_or("a root descriptor without its high half")?.1)
@@ -1076,6 +1076,10 @@ impl<'a> Tracer<'a> {
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
+            // The low byte of it (a 40-bit address: console vertex programs
+            // take their vertex-buffer table's so).
+            || high.is_some() && matches!(hi, Term::Value(v) if self.sop2(v, &["s_bfe_u32"])
+                .is_some_and(|(_, [a, b])| a == want && b == Term::Const(0x0008_0000)))
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))

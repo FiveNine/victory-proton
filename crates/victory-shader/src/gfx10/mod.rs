@@ -16,7 +16,7 @@
 
 mod fields;
 mod opcodes;
-mod sp3;
+pub(crate) mod sp3;
 
 pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Valu};
 

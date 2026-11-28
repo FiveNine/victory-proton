@@ -2189,6 +2189,13 @@ impl<'a> Lower<'a> {
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.lds_title_dwords = s.lds_dwords;
+            // shortcut: host lane n taken as console lane n, as with RADV,
+            // whose mesh waves have 64 lanes; DXIL lets a mesh shader declare
+            // no wave size. Refused on hosts of at most 32 lanes.
+            if ms.console && x.native.wave64 && host_max_wave() != 32 {
+                s.wave_size = Some(64);
+                console_lanes = true;
+            }
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
@@ -2323,9 +2330,12 @@ impl<'a> Lower<'a> {
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
-            mask_data: match x.native.stage {
-                HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
+            mask_data: match (&x.native.io, x.native.stage) {
+                // The console path's mesh programs: host lane n is console
+                // lane n, the program declaring 64-lane waves (below).
+                (crate::native::StageIo::Ms(ms), _) if ms.console => MaskData::Console,
+                (_, HwStage::Cs) => MaskData::Console,
+                (_, HwStage::Ps | HwStage::Vs) => MaskData::Host,
                 _ => MaskData::None,
             },
             mask_ok: false,
@@ -3197,6 +3207,21 @@ impl<'a> Lower<'a> {
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
+            // `POS_FIXED_PT`: the pixel's integer x in bits 0-15, y in 16-31.
+            Input::FixedPosition => {
+                let (Val::I32(x), Val::I32(y)) = (self.input(Input::Position(0)), self.input(Input::Position(1))) else {
+                    return Val::Missing("a pixel system input the signature lacks");
+                };
+                let b = self.s.entry;
+                let (xf, yf) = (self.s.m.cast(b, Cast::Bitcast, x, self.s.t.f32), self.s.m.cast(b, Cast::Bitcast, y, self.s.t.f32));
+                let xi = self.s.m.cast(b, Cast::FpToUi, xf, self.s.t.i32);
+                let yi = self.s.m.cast(b, Cast::FpToUi, yf, self.s.t.i32);
+                let m = self.s.m.i32(0xFFFF);
+                let xi = self.s.m.bin(b, Bin::And, xi, m);
+                let k16 = self.s.m.i32(16);
+                let yi = self.s.m.bin(b, Bin::Shl, yi, k16);
+                return Val::I32(self.s.m.bin(b, Bin::Or, xi, yi));
+            }
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
@@ -3451,7 +3476,10 @@ impl<'a> Lower<'a> {
         let rp = self.x.native.layout[param];
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
+            // The host's vertex id counts from the base vertex already.
+            RootType::BaseVertex => return Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => {}
+            RootType::VertexTable => return Val::Missing("a vertex-buffer table read as data"),
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword - self.user_first();
@@ -5429,7 +5457,8 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() {
+        // (The console path's mesh programs declare 64-lane waves.)
+        if self.s.mesh.is_some() && !self.console_lanes {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
             // memory if mesh programs turn out to need these.
@@ -12892,6 +12921,122 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::Add, at, off))
     }
 
+    /// Vertex buffer `k` when `src` is descriptor k of a console vertex
+    /// program's vertex-buffer table ([`RootType::VertexTable`]).
+    fn vertex_slot(&self, src: &Source) -> Option<u8> {
+        let Source::Loaded { load, first: 0 } = src else { return None };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::VertexTable && a.dynamic.is_none() && a.dynamic2.is_none() && a.offset % 16 == 0 && a.offset < 16 * 16)
+            .then_some((a.offset / 16) as u8)
+    }
+
+    /// A console vertex program's fetch from vertex buffer `slot`
+    /// (`buffer_load_dword*` or `tbuffer_load_format_*` by index): bytes
+    /// `element * stride + off` of the root SRV `t<SLOT_VERTEX + slot>`
+    /// ([`super::shader::SLOT_VERTEX`]), zeros past the buffer's size;
+    /// stride and size are user data the host gives
+    /// ([`super::shader::USER_VERTEX_BUFFER`]).
+    #[allow(clippy::too_many_arguments)]
+    fn vertex_fetch(
+        &mut self,
+        inst: &Inst,
+        slot: u8,
+        element: V,
+        off: V,
+        format: Option<u8>,
+        count: u32,
+        reg: u8,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let count = count.min(4) as u8;
+        use super::shader::{SLOT_VERTEX, USER_VERTEX_BUFFER};
+        let stride = self.host_word(RootType::Other(USER_VERTEX_BUFFER), slot, 0);
+        let size = self.host_word(RootType::Other(USER_VERTEX_BUFFER), slot, 1);
+        let h = self.s.root_srv_handle(SLOT_VERTEX + slot);
+        let c = self.cur;
+        let at = self.s.m.bin(c, Bin::Mul, element, stride);
+        let at = self.s.m.bin(c, Bin::Add, at, off);
+        let inside = self.s.m.cmp(c, pred::IULT, at, size);
+        let res = self.s.t.res_ret;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let align = self.s.m.i32(4);
+        let zero = self.s.m.i32(0);
+        // The dword holding byte `byte`, as an i32.
+        let dword_at = |l: &mut Self, byte: V| -> V {
+            let c = l.cur;
+            let m = l.s.m.i32(!3);
+            let base = l.s.m.bin(c, Bin::And, byte, m);
+            let mask = l.s.m.i8(1);
+            let r = l.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[h, base, iu, mask, align]);
+            let x = l.s.m.extract(c, r, 0);
+            l.as_int(x)
+        };
+        let values: Vec<V> = match format {
+            None => {
+                // Whole dwords (the program's offsets are multiples of 4).
+                let mask = self.s.m.i8((1u8 << count) - 1);
+                let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[h, at, iu, mask, align]);
+                (0..count)
+                    .map(|k| {
+                        let x = self.s.m.extract(c, r, u32::from(k));
+                        self.as_int(x)
+                    })
+                    .collect()
+            }
+            Some(f) => {
+                let name = crate::gfx10::sp3::buffer_format(f);
+                // Byte channels, each from the dword that holds it.
+                let (channels, unorm) = match name.as_str() {
+                    "BUF_FMT_8_UNORM" => (1, true),
+                    "BUF_FMT_8_8_UNORM" => (2, true),
+                    "BUF_FMT_8_8_8_8_UNORM" => (4, true),
+                    "BUF_FMT_8_UINT" => (1, false),
+                    "BUF_FMT_8_8_UINT" => (2, false),
+                    "BUF_FMT_8_8_8_8_UINT" => (4, false),
+                    _ => return Err("a vertex format other than 8-bit channels"),
+                };
+                (0..count)
+                    .map(|k| {
+                        if k >= channels {
+                            // Channels the format lacks: 0, 0, 0, then 1.
+                            return if k == 3 {
+                                if unorm { self.s.m.i32(0x3F80_0000) } else { self.s.m.i32(1) }
+                            } else {
+                                zero
+                            };
+                        }
+                        let c = self.cur;
+                        let kk = self.s.m.i32(u32::from(k));
+                        let byte = self.s.m.bin(c, Bin::Add, at, kk);
+                        let word = dword_at(self, byte);
+                        let k3 = self.s.m.i32(3);
+                        let lane = self.s.m.bin(c, Bin::And, byte, k3);
+                        let k3s = self.s.m.i32(3);
+                        let shift = self.s.m.bin(c, Bin::Shl, lane, k3s);
+                        let x = self.s.m.bin(c, Bin::LShr, word, shift);
+                        let ff = self.s.m.i32(0xFF);
+                        let x = self.s.m.bin(c, Bin::And, x, ff);
+                        if unorm {
+                            let f = self.s.m.cast(c, Cast::UiToFp, x, self.s.t.f32);
+                            let scale = self.s.m.f32((1.0f32 / 255.0).to_bits());
+                            let f = self.s.m.bin(c, Bin::Mul, f, scale);
+                            self.as_int(f)
+                        } else {
+                            x
+                        }
+                    })
+                    .collect()
+            }
+        };
+        let c = self.cur;
+        for (k, x) in values.into_iter().enumerate() {
+            let x = self.s.m.select(c, inside, x, zero);
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.root_copy = None;
         let Fields::Buffer {
@@ -12993,6 +13138,18 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
+        if let Some(slot) = self.vertex_slot(src) {
+            let Some(element) = index else {
+                return Err("a vertex buffer read without an index");
+            };
+            if store || atomic.is_some() || narrow.is_some() || d16 {
+                return Err("a vertex buffer access other than a load");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer load result");
+            };
+            return self.vertex_fetch(inst, slot, element, off, *format, count, reg, guard);
+        }
         let used = self.used_kind(src);
         // Sixteen bits a channel through a view of a table: the bits go as
         // they are, as unsigned integers, and the host is told, which shows
@@ -13552,7 +13709,13 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
+        // A compressed colour export: two f16 channels a dword, red and
+        // green in the first, blue and alpha in the second (each channel's
+        // value is its dword). shortcut: taken as `SPI_SHADER_COL_FORMAT`
+        // FP16_ABGR, as for every compressed export of the console path's
+        // captured pipelines (2026-11-28), not the 16-bit integer or norm
+        // formats.
+        if e.compressed && !matches!(e.target, Target::Color(_)) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -13658,7 +13821,12 @@ impl<'a> Lower<'a> {
                     _ => None,
                 },
                 Target::Param { usage, row } | Target::PrimitiveParam { usage, row } => {
-                    let row = param_row(usage, row);
+                    // One row a channel ([`crate::native::CHANNEL_ROWS`]).
+                    let row = if usage == crate::native::CHANNEL_ROWS {
+                        Some(row + ch)
+                    } else {
+                        param_row(usage, row)
+                    };
                     outputs
                         .iter()
                         .position(|o| {
@@ -13693,7 +13861,7 @@ impl<'a> Lower<'a> {
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                stores.push((id, col, value, e.compressed.then_some(ch & 1 == 1)));
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {

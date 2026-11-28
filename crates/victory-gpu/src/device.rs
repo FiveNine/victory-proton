@@ -433,6 +433,28 @@ extern "system" fn compute_fspx(this: This, desc: *const u8, iid: *const Iid, ou
     }
 }
 
+/// Device method 0x1c8: graphics pipelines from the console compiler's
+/// pieces ([`pipeline::create_graphics_fspx`]) with `VICTORY_FSPX_PIPELINES=1`,
+/// else refused as before.
+extern "system" fn graphics_fspx(this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> HRESULT {
+    if pipeline::fspx_pipelines() {
+        let r = pipeline::create_graphics_fspx(this, desc.cast(), iid, out);
+        // The ones refused, for `VICTORY_UNKNOWN_PIPELINE_DIR` (the first 3000).
+        #[cfg(windows)]
+        if r < 0 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static REFUSED: AtomicU32 = AtomicU32::new(0);
+            let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 3000 {
+                dump_unknown_pipeline(0x1c8, n, desc as usize);
+            }
+        }
+        r
+    } else {
+        unknown_pipeline::<0x1c8>(this, desc, iid, out)
+    }
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -538,7 +560,7 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = graphics_fspx as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[67] = compute_fspx as *const (); // 0x218

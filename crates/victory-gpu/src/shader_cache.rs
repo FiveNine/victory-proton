@@ -311,6 +311,8 @@ fn root_code(r: RootType) -> u32 {
         RootType::ImmediateSampler => 3,
         RootType::ResourceHeap => 4,
         RootType::SamplerHeap => 5,
+        RootType::VertexTable => 0x8000_0000,
+        RootType::BaseVertex => 0x8000_0001,
         RootType::Other(x) => 6 + x,
     }
 }
@@ -323,6 +325,8 @@ fn root_type(code: u32) -> RootType {
         3 => RootType::ImmediateSampler,
         4 => RootType::ResourceHeap,
         5 => RootType::SamplerHeap,
+        0x8000_0000 => RootType::VertexTable,
+        0x8000_0001 => RootType::BaseVertex,
         x => RootType::Other(x - 6),
     }
 }

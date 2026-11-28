@@ -91,6 +91,137 @@ impl Default for GraphicsState {
     }
 }
 
+impl GraphicsState {
+    /// The state of a console graphics pipeline (device method 0x1c8) from
+    /// its packet and pipeline metadata, decoded from 3,360 captured
+    /// pipelines (2026-11-28): packet dwords 46 `DB_DEPTH_CONTROL`, 47
+    /// `DB_STENCIL_CONTROL`, 48 `DB_STENCILREFMASK`, 51 `CB_TARGET_MASK`,
+    /// 52-59 `CB_BLEND0-7_CONTROL`; metadata bytes 0x10-0x17 the targets'
+    /// formats, 0x24 the depth format, 0x25 the target count, 0x26 the
+    /// topology type (19 rectangle lists), 0x28 the sample count.
+    /// shortcut: no culling and no depth bias (the rasterizer's registers
+    /// are not found yet), and strip cuts off.
+    /// A mesh pipeline's packet has the dwords from 22 on 21 later
+    /// (`victory_shader::native::GFX_MESH_SHIFT`).
+    pub(crate) fn from_console(packet: &[u8], meta: &[u8], mesh: bool) -> Option<GraphicsState> {
+        use victory_shader::native::{GFX_MESH_SHIFT, GFX_SHIFT_FROM};
+        let word = |i: usize| {
+            let i = if mesh && i >= GFX_SHIFT_FROM { i + GFX_MESH_SHIFT } else { i };
+            packet.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let byte = |i: usize| meta.get(i).copied();
+        let mut g = GraphicsState::default();
+        let count = byte(0x25)?.min(8);
+        g.targets.NumRenderTargets = u32::from(count);
+        for i in 0..usize::from(count) {
+            let f = u32::from(byte(0x10 + i)?);
+            g.targets.RTFormats[i] = DXGI_FORMAT(crate::resource::target_format(crate::resource::pc_format(f)) as i32);
+        }
+        g.depth_format = DXGI_FORMAT(crate::resource::pc_format(u32::from(byte(0x24)?)) as i32);
+        // As the title's streams give it: 19 is the console's rectangle lists.
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(i32::from(byte(0x26)?));
+        g.samples.Count = u32::from(byte(0x28)?.max(1));
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        // The console's compare functions are D3D12's less one.
+        let func = |f: u32| D3D12_COMPARISON_FUNC((f & 7) as i32 + 1);
+        let op = |o: u32| match o & 0xF {
+            1 => D3D12_STENCIL_OP_ZERO,
+            3 | 4 => D3D12_STENCIL_OP_REPLACE,
+            5 => D3D12_STENCIL_OP_INCR_SAT,
+            6 => D3D12_STENCIL_OP_DECR_SAT,
+            7 => D3D12_STENCIL_OP_INVERT,
+            8 => D3D12_STENCIL_OP_INCR,
+            9 => D3D12_STENCIL_OP_DECR,
+            _ => D3D12_STENCIL_OP_KEEP,
+        };
+        let dc = word(46)?;
+        let sc = word(47)?;
+        let refmask = word(48)?;
+        g.depth.DepthEnable = (dc >> 1 & 1 != 0).into();
+        g.depth.DepthWriteMask = if dc >> 2 & 1 != 0 { D3D12_DEPTH_WRITE_MASK_ALL } else { D3D12_DEPTH_WRITE_MASK_ZERO };
+        g.depth.DepthFunc = func(dc >> 4);
+        g.depth_bounds = dc >> 3 & 1 != 0;
+        g.depth.StencilEnable = (dc & 1 != 0).into();
+        g.depth.StencilReadMask = (refmask >> 8) as u8;
+        g.depth.StencilWriteMask = (refmask >> 16) as u8;
+        g.depth.FrontFace = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: op(sc),
+            StencilPassOp: op(sc >> 4),
+            StencilDepthFailOp: op(sc >> 8),
+            StencilFunc: func(dc >> 8),
+        };
+        g.depth.BackFace = if dc >> 7 & 1 != 0 {
+            D3D12_DEPTH_STENCILOP_DESC {
+                StencilFailOp: op(sc >> 12),
+                StencilPassOp: op(sc >> 16),
+                StencilDepthFailOp: op(sc >> 20),
+                StencilFunc: func(dc >> 20),
+            }
+        } else {
+            g.depth.FrontFace
+        };
+        let factor = |f: u32| match f & 0x1F {
+            0 => D3D12_BLEND_ZERO,
+            1 => D3D12_BLEND_ONE,
+            2 => D3D12_BLEND_SRC_COLOR,
+            3 => D3D12_BLEND_INV_SRC_COLOR,
+            4 => D3D12_BLEND_SRC_ALPHA,
+            5 => D3D12_BLEND_INV_SRC_ALPHA,
+            6 => D3D12_BLEND_DEST_ALPHA,
+            7 => D3D12_BLEND_INV_DEST_ALPHA,
+            8 => D3D12_BLEND_DEST_COLOR,
+            9 => D3D12_BLEND_INV_DEST_COLOR,
+            10 => D3D12_BLEND_SRC_ALPHA_SAT,
+            13 => D3D12_BLEND_BLEND_FACTOR,
+            14 => D3D12_BLEND_INV_BLEND_FACTOR,
+            15 => D3D12_BLEND_SRC1_COLOR,
+            16 => D3D12_BLEND_INV_SRC1_COLOR,
+            17 => D3D12_BLEND_SRC1_ALPHA,
+            18 => D3D12_BLEND_INV_SRC1_ALPHA,
+            19 => D3D12_BLEND_ALPHA_FACTOR,
+            20 => D3D12_BLEND_INV_ALPHA_FACTOR,
+            _ => D3D12_BLEND_ONE,
+        };
+        let comb = |f: u32| match f & 7 {
+            1 => D3D12_BLEND_OP_SUBTRACT,
+            2 => D3D12_BLEND_OP_MIN,
+            3 => D3D12_BLEND_OP_MAX,
+            4 => D3D12_BLEND_OP_REV_SUBTRACT,
+            _ => D3D12_BLEND_OP_ADD,
+        };
+        let mask = word(51)?;
+        g.blend.IndependentBlendEnable = true.into();
+        for i in 0..8 {
+            let b = word(52 + i)?;
+            let t = &mut g.blend.RenderTarget[i];
+            t.RenderTargetWriteMask = (mask >> (4 * i) & 0xF) as u8;
+            t.BlendEnable = (b >> 30 & 1 != 0).into();
+            t.SrcBlend = factor(b);
+            t.BlendOp = comb(b >> 5);
+            t.DestBlend = factor(b >> 8);
+            // D3D12 takes no colour factors for alpha: their alpha twins.
+            let alpha = |f: D3D12_BLEND| match f {
+                D3D12_BLEND_SRC_COLOR => D3D12_BLEND_SRC_ALPHA,
+                D3D12_BLEND_INV_SRC_COLOR => D3D12_BLEND_INV_SRC_ALPHA,
+                D3D12_BLEND_DEST_COLOR => D3D12_BLEND_DEST_ALPHA,
+                D3D12_BLEND_INV_DEST_COLOR => D3D12_BLEND_INV_DEST_ALPHA,
+                D3D12_BLEND_SRC1_COLOR => D3D12_BLEND_SRC1_ALPHA,
+                D3D12_BLEND_INV_SRC1_COLOR => D3D12_BLEND_INV_SRC1_ALPHA,
+                f => f,
+            };
+            let (src, op, dst) = if b >> 29 & 1 != 0 {
+                (factor(b >> 16), comb(b >> 21), factor(b >> 24))
+            } else {
+                (t.SrcBlend, t.BlendOp, t.DestBlend)
+            };
+            t.SrcBlendAlpha = alpha(src);
+            t.BlendOpAlpha = op;
+            t.DestBlendAlpha = alpha(dst);
+        }
+        Some(g)
+    }
+}
+
 /// Integer render target formats: D3D12 cannot blend into them.
 fn integer_format(f: DXGI_FORMAT) -> bool {
     matches!(

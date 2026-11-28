@@ -441,7 +441,7 @@ fn sendmsg(imm: u16) -> String {
     }
 }
 
-fn buffer_format(format: u8) -> String {
+pub(crate) fn buffer_format(format: u8) -> String {
     const NAMES: [&str; 78] = [
         "INVALID",
         "8_UNORM",

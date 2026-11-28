@@ -1638,6 +1638,11 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        // A console vertex program's vertex buffer `slot`: stride, size.
+        if kind == victory_shader::emit::USER_VERTEX_BUFFER {
+            let v = self.vertex.get(usize::from(slot)).copied().unwrap_or_default();
+            return if dword == 0 { v.stride } else { v.size };
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
@@ -2069,7 +2074,17 @@ impl State {
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
-                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    // A console vertex program's vertex buffer: the view
+                    // the title set with `IASetVertexBuffers`.
+                    let vertex = slot.checked_sub(victory_shader::emit::SLOT_VERTEX).filter(|&k| srv && k < 16);
+                    let address = match vertex {
+                        Some(k) => Some(self.vertex[usize::from(k)].address).filter(|&a| a != 0).map(Root::View),
+                        None => match self.roots_ref(compute).get(usize::from(slot)) {
+                            Some(&Root::View(a)) => Some(Root::View(a)),
+                            _ => None,
+                        },
+                    };
+                    let Some(Root::View(address)) = address
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.

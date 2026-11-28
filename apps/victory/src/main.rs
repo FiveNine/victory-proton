@@ -75,6 +75,18 @@ enum Command {
         #[arg(long)]
         disasm: bool,
     },
+    /// Build one container per stage (`<n>-vs.dxbc`, `<n>-ps.dxbc`) from
+    /// captured console graphics pipelines (device method 0x1c8; pieces
+    /// `1c8-<n>-01.bin` packet, `-05`/`-07` pixel code and metadata,
+    /// `-09`/`-11` vertex code and metadata) for `translate`.
+    FspxGraphics { captures: PathBuf, out: PathBuf },
+    /// Decode a file of raw GFX10 machine code (a captured program).
+    Disasm {
+        files: Vec<PathBuf>,
+        /// Lane masks as 32 lanes.
+        #[arg(long)]
+        wave32: bool,
+    },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
     ///
@@ -207,6 +219,8 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        Command::FspxGraphics { captures, out } => shader::fspx_graphics(&captures, &out),
+        Command::Disasm { files, wave32 } => shader::disasm(&files, !wave32),
         Command::Translate {
             paths,
             validate,

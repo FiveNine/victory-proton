@@ -213,6 +213,56 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     Ok(())
 }
 
+/// Containers of the captured console graphics pipelines' stages.
+pub fn fspx_graphics(captures: &std::path::Path, out: &std::path::Path) -> Result<()> {
+    use victory_shader::native::{FSPX_MESH, FSPX_MESH_PIPELINE, FSPX_PIXEL, FSPX_VERTEX, fspx_graphics_container};
+    std::fs::create_dir_all(out)?;
+    let (mut made, mut failed) = (0, 0);
+    for entry in std::fs::read_dir(captures)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        let Some(n) = name.strip_prefix("1c8-").and_then(|r| r.strip_suffix("-01.bin")) else {
+            continue;
+        };
+        let piece = |k: u32| std::fs::read(captures.join(format!("1c8-{n}-{k:02}.bin"))).ok();
+        let Some(packet) = piece(1) else { continue };
+        let stages = if piece(13).is_some() {
+            [(FSPX_MESH | FSPX_MESH_PIPELINE, 13, 15, "ms"), (FSPX_PIXEL | FSPX_MESH_PIPELINE, 5, 7, "ps")]
+        } else {
+            [(FSPX_VERTEX, 9, 11, "vs"), (FSPX_PIXEL, 5, 7, "ps")]
+        };
+        for (stage, code, meta, tag) in stages {
+            let (Some(code), Some(meta)) = (piece(code), piece(meta)) else { continue };
+            match fspx_graphics_container(&packet, stage, &code, &meta) {
+                Ok(c) => {
+                    std::fs::write(out.join(format!("{n}-{tag}.dxbc")), c)?;
+                    made += 1;
+                }
+                Err(e) => {
+                    println!("{n} {tag}: {e}");
+                    failed += 1;
+                }
+            }
+        }
+    }
+    println!("{made} containers, {failed} failed");
+    Ok(())
+}
+
+/// Lists the instructions of a file of raw machine code.
+pub fn disasm(files: &[PathBuf], wave64: bool) -> Result<()> {
+    for file in files {
+        if files.len() > 1 {
+            println!("# {}", file.display());
+        }
+        let code = std::fs::read(file)?;
+        match gfx10::decode(&code) {
+            Ok(insts) => insts.iter().for_each(|i| println!("{}", format_instruction(i, wave64))),
+            Err(e) => println!("    ({e})"),
+        }
+    }
+    Ok(())
+}
+
 fn format_instruction(i: &Instruction, wave64: bool) -> String {
     let words: Vec<_> = i.words.iter().map(|w| format!("{w:08X}")).collect();
     let text = match i.name() {

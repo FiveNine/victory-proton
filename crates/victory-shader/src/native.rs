@@ -136,6 +136,42 @@ const PACKET_RSRC1: usize = 0x14;
 const PACKET_RSRC2: usize = 0x18;
 const FSPX_RECORDS: usize = 0x18;
 const FSPX_RECORD: usize = 32;
+/// The FSPX entry of a graphics stage's program ([`fspx_graphics`]): a u32,
+/// [`FSPX_VERTEX`] or [`FSPX_PIXEL`]; entry [`FSPX_PACKET`] then holds
+/// the whole graphics pipeline's packet.
+const FSPX_STAGE: u32 = 2;
+pub const FSPX_VERTEX: u32 = 0;
+pub const FSPX_PIXEL: u32 = 1;
+/// The geometry slot of a mesh pipeline (the console's mesh programs:
+/// one NGG stage, as the PC path's mesh shaders run).
+pub const FSPX_MESH: u32 = 2;
+/// Or-ed into the stage of either stage of a pipeline with a mesh stage:
+/// its packet is [`GFX_MESH_SHIFT`] dwords longer.
+pub const FSPX_MESH_PIPELINE: u32 = 0x100;
+/// Dwords a mesh pipeline's packet holds more (the geometry stage's
+/// registers): dword n of a vertex pipeline's packet from
+/// [`GFX_SHIFT_FROM`] on is dword n + 21 of a mesh pipeline's.
+pub const GFX_MESH_SHIFT: usize = 21;
+pub const GFX_SHIFT_FROM: usize = 22;
+/// A mesh pipeline's `SPI_SHADER_PGM_RSRC1/2_GS` and
+/// `VGT_GS_ONCHIP_CNTL` (vertices bits 0-10, primitives 11-21).
+const GFX_GS_RSRC1: usize = 24 * 4;
+const GFX_GS_RSRC2: usize = 25 * 4;
+const GFX_GS_ONCHIP: usize = 28 * 4;
+/// Dwords of a graphics pipeline's packet (device method 0x1c8; 3,360
+/// captured pipelines, 2026-11-28): `SPI_SHADER_PGM_RSRC1/2_VS`, the
+/// same of the pixel stage (0 without one), `SPI_PS_INPUT_ENA`, the pixel
+/// stage's attribute count, `DB_SHADER_CONTROL`, `SPI_SHADER_COL_FORMAT`.
+/// A graphics stage's metadata records follow a 16-byte header.
+const GFX_RECORDS: usize = 0x10;
+const GFX_VS_RSRC1: usize = 14 * 4;
+const GFX_VS_RSRC2: usize = 15 * 4;
+const GFX_PS_RSRC1: usize = 19 * 4;
+const GFX_PS_RSRC2: usize = 20 * 4;
+const GFX_PS_INPUT_ENA: usize = 22 * 4;
+const GFX_PS_ATTRIBUTES: usize = 23 * 4;
+const GFX_DB_SHADER_CONTROL: usize = 26 * 4;
+const GFX_COL_FORMAT: usize = 28 * 4;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -205,6 +241,13 @@ pub enum Usage {
     ClipDistance,
     Other(u8),
 }
+
+/// The usage of the console path's graphics I/O ([`fspx_graphics`]): one
+/// signature row a channel, channel c of attribute or parameter n in row
+/// `row + c` (`row` = 1 + 4n), column c. A pixel program may interpolate
+/// one channel of an attribute and take another flat, and the host wants
+/// one interpolation mode a row.
+pub const CHANNEL_ROWS: Usage = Usage::Other(0xC4);
 
 impl Usage {
     fn from_raw(raw: u8) -> Self {
@@ -291,6 +334,9 @@ pub enum StageIo {
 /// `exp param`) and primitive n (`exp prim`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshIo {
+    /// A console-path program ([`fspx_graphics`]): written for 64-lane
+    /// waves, its group input the same in every lane.
+    pub console: bool,
     /// `exp param<n>` targets; `param` bit 7 set: a per-primitive output,
     /// `row` then a row of the primitive signature (`PSG1`).
     pub outputs: Vec<VsOutput>,
@@ -368,6 +414,15 @@ pub enum RootType {
     ResourceHeap,
     /// The 32-bit address of the sampler heap.
     SamplerHeap,
+    /// A console vertex shader's vertex-buffer table: the 64-bit address
+    /// of 16-byte buffer descriptors, one per input slot, which the code
+    /// loads and fetches its vertices through (`buffer_load_* idxen`). The
+    /// host gives each slot's buffer as user data instead
+    /// ([`crate::emit::USER_VERTEX_BUFFER`]).
+    VertexTable,
+    /// A console vertex shader's base vertex, which it adds to the vertex
+    /// index; the host's vertex id has it already (0).
+    BaseVertex,
     Other(u32),
 }
 
@@ -512,40 +567,19 @@ pub fn fspx_container(registers: &[u8], pipeline: &[u8], code: &[u8], program: &
     crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx_from_parts(registers, pipeline, code, program))])
 }
 
-pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
-    if u32_at(part, 4)? != FSPX_VERSION {
-        return Err(Malformed("unknown FSPX version"));
-    }
-    let count = u32_at(part, 8)? as usize;
-    if count > MAX_XDAT_ENTRIES {
-        return Err(Malformed("implausible FSPX entry count"));
-    }
-    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
-        for i in 0..count {
-            let at = FSPX_HEADER + 16 * i;
-            if u32_at(part, at)? == kind {
-                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
-                return bytes(part, offset.into(), size.into())
-                    .ok_or(Malformed("FSPX entry out of bounds"));
-            }
-        }
-        Err(Malformed("FSPX entry missing"))
-    };
-    let packet = entry(FSPX_PACKET)?;
-    let code = entry(FSPX_CODE)?;
-    let meta = entry(FSPX_METADATA)?;
-    if u32_at(meta, 8)? as usize * 4 != code.len() {
-        return Err(Malformed("FSPX code size disagrees"));
-    }
-    let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
-    // VGPRs in granules of 4 (wave64) or 8 (wave32).
-    let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
-    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
-    let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
-    let mut layout: Vec<RootParam> = Vec::new();
+/// The root parameters and used resources an FSPX program's metadata
+/// records name, with the user SGPRs past them that hold the heaps: from
+/// `heaps_at` if given, else past the last parameter.
+fn fspx_records(
+    meta: &[u8],
+    first: usize,
+    user_sgprs: u8,
+    heaps_at: Option<u8>,
+    mut layout: Vec<RootParam>,
+) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
     let mut used = Vec::new();
     for e in meta
-        .get(FSPX_RECORDS..)
+        .get(first..)
         .unwrap_or(&[])
         .as_chunks::<FSPX_RECORD>()
         .0
@@ -609,10 +643,10 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     }
     // Root constants hold the user SGPRs up to the next parameter's, or to
     // the last user SGPR (`COMPUTE_PGM_RSRC2` bits 1-5).
-    let user_sgprs = (u32_at(packet, PACKET_RSRC2)? >> 1 & 0x1F) as u8;
     let starts: Vec<u8> = layout.iter().map(|p| p.user_data).collect();
     for p in layout.iter_mut().filter(|p| p.root == RootType::Constants) {
         let end = starts.iter().copied().filter(|&s| s > p.user_data).min().unwrap_or(user_sgprs);
+        let end = heaps_at.map_or(end, |h| end.min(h));
         if end <= p.user_data {
             return Err(Malformed("FSPX root constants past the user SGPRs"));
         }
@@ -626,7 +660,8 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     // `s6 + index * 32` (run fspx1, 2026-11-28: 74 programs read s6 or s10
     // with nothing mapped there).
     let mapped_end = layout.iter().map(|p| u32::from(p.user_data) + p.sgprs).max().unwrap_or(0);
-    for (k, at) in (mapped_end..u32::from(user_sgprs)).take(2).enumerate() {
+    let heaps_from = heaps_at.map_or(mapped_end, u32::from);
+    for (k, at) in (heaps_from..u32::from(user_sgprs)).take(2).enumerate() {
         layout.push(RootParam {
             root: if k == 0 { RootType::ResourceHeap } else { RootType::SamplerHeap },
             table_offset_dwords: 0,
@@ -636,6 +671,47 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             slot: 0xF0 + k as u8,
         });
     }
+    Ok((layout, used))
+}
+
+pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if let Some(stage) = fspx_entry(part, FSPX_STAGE)? {
+        let packet = fspx_entry(part, FSPX_PACKET)?.ok_or(Malformed("FSPX entry missing"))?;
+        let code = fspx_entry(part, FSPX_CODE)?.ok_or(Malformed("FSPX entry missing"))?;
+        let meta = fspx_entry(part, FSPX_METADATA)?.ok_or(Malformed("FSPX entry missing"))?;
+        return fspx_graphics(packet, u32_at(stage, 0)?, code, meta);
+    }
+    if u32_at(part, 4)? != FSPX_VERSION {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX entry count"));
+    }
+    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
+        for i in 0..count {
+            let at = FSPX_HEADER + 16 * i;
+            if u32_at(part, at)? == kind {
+                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+                return bytes(part, offset.into(), size.into())
+                    .ok_or(Malformed("FSPX entry out of bounds"));
+            }
+        }
+        Err(Malformed("FSPX entry missing"))
+    };
+    let packet = entry(FSPX_PACKET)?;
+    let code = entry(FSPX_CODE)?;
+    let meta = entry(FSPX_METADATA)?;
+    if u32_at(meta, 8)? as usize * 4 != code.len() {
+        return Err(Malformed("FSPX code size disagrees"));
+    }
+    let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
+    // VGPRs in granules of 4 (wave64) or 8 (wave32).
+    let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
+    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
+    let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let user_sgprs = (u32_at(packet, PACKET_RSRC2)? >> 1 & 0x1F) as u8;
+    let (layout, used) = fspx_records(meta, FSPX_RECORDS, user_sgprs, None, Vec::new())?;
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -648,6 +724,276 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }),
         code: code.to_vec(),
     })
+}
+
+/// Entry `kind` of an FSPX blob, if it has one.
+fn fspx_entry(part: &[u8], kind: u32) -> Result<Option<&[u8]>, ShaderError> {
+    if u32_at(part, 4)? != FSPX_VERSION {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX entry count"));
+    }
+    for i in 0..count {
+        let at = FSPX_HEADER + 16 * i;
+        if u32_at(part, at)? == kind {
+            let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+            return bytes(part, offset.into(), size.into())
+                .map(Some)
+                .ok_or(Malformed("FSPX entry out of bounds"));
+        }
+    }
+    Ok(None)
+}
+
+/// The `exp param<n>` targets a program's code writes, in order.
+fn exported_params(code: &[u8]) -> Result<Vec<u8>, ShaderError> {
+    let mut out: Vec<u8> = crate::gfx10::decode(code)?
+        .iter()
+        .filter_map(|i| match i.fields(true) {
+            crate::gfx10::Fields::Exp { target: t @ 32..=63, .. } => Some(t - 32),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// One stage of a console graphics pipeline (device method 0x1c8) from
+/// the pipeline's packet and the stage's code and metadata
+/// ([`fspx_graphics_container`]). Its I/O, which no stage data gives, is
+/// what the console's fixed linkage makes it: vertex parameter n is pixel
+/// attribute n (`TEXCOORDn` here, row n + 1 after the position), the
+/// vertex shader fetches its vertices itself through the table at s0
+/// ([`RootType::VertexTable`]) at index v0 + s2 ([`RootType::BaseVertex`]),
+/// and a pixel shader writes the targets `SPI_SHADER_COL_FORMAT` enables.
+pub fn fspx_graphics(packet: &[u8], stage: u32, code: &[u8], meta: &[u8]) -> Result<NativeProgram, ShaderError> {
+    let shifted = stage & FSPX_MESH_PIPELINE != 0;
+    // A dword of the packet, by its place in a vertex pipeline's.
+    let word = |at: usize| {
+        let i = at / 4;
+        u32_at(packet, 4 * if shifted && i >= GFX_SHIFT_FROM { i + GFX_MESH_SHIFT } else { i })
+    };
+    let (pixel, mesh) = match stage & !FSPX_MESH_PIPELINE {
+        FSPX_VERTEX => (false, false),
+        FSPX_PIXEL => (true, false),
+        FSPX_MESH => (false, true),
+        _ => return Err(Malformed("unknown FSPX graphics stage")),
+    };
+    let (rsrc1, rsrc2) = if pixel {
+        (u32_at(packet, GFX_PS_RSRC1)?, u32_at(packet, GFX_PS_RSRC2)?)
+    } else if mesh {
+        (u32_at(packet, GFX_GS_RSRC1)?, u32_at(packet, GFX_GS_RSRC2)?)
+    } else {
+        (u32_at(packet, GFX_VS_RSRC1)?, u32_at(packet, GFX_VS_RSRC2)?)
+    };
+    // shortcut: wave64, as every program whose lane masks show it is
+    // (3,360 captured pipelines; their vertex programs use none).
+    let wave64 = true;
+    let vgprs = (((rsrc1 & 0x3F) + 1) * 4).min(256) as u16;
+    let user_sgprs = (rsrc2 >> 1 & 0x1F) as u8;
+    let mut seeded = Vec::new();
+    if !pixel && !mesh {
+        seeded.push(RootParam {
+            root: RootType::VertexTable,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0xF4,
+        });
+        seeded.push(RootParam {
+            root: RootType::BaseVertex,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 2,
+            slot: 0xF5,
+        });
+    }
+    // The last two of twelve user SGPRs hold the view and sampler heaps
+    // (a pixel program loads samplers at `s11 + index * 16`).
+    // Unless a record names one of those SGPRs itself.
+    let named = |at: u8| {
+        meta.get(GFX_RECORDS..).unwrap_or(&[]).as_chunks::<FSPX_RECORD>().0.iter().any(|e| e[0] == 0x41 && e[21] >= at)
+    };
+    let heaps_at = (user_sgprs >= 12 && !named(user_sgprs - 2)).then_some(user_sgprs - 2);
+    let (layout, used) = fspx_records(meta, GFX_RECORDS, user_sgprs, heaps_at, seeded)?;
+    let io = if pixel {
+        let attributes = word(GFX_PS_ATTRIBUTES)?.min(32) as u8;
+        let ena = word(GFX_PS_INPUT_ENA)?;
+        StageIo::Ps {
+            inputs: (0..attributes)
+                .map(|n| PsInput {
+                    usage: CHANNEL_ROWS,
+                    row: 1 + 4 * n,
+                    mask: 0xF,
+                    attr: n,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                })
+                .collect(),
+            input_addr: ena,
+            db_shader_control: word(GFX_DB_SHADER_CONTROL)?,
+            patches: Vec::new(),
+        }
+    } else if mesh {
+        // One lane a vertex and a primitive: the group as many lanes as
+        // the larger of the two, in whole waves (the code divides its
+        // group input by that). LDS: `SPI_SHADER_PGM_RSRC2_GS` bits
+        // 19-26, in 512 bytes.
+        let onchip = u32_at(packet, GFX_GS_ONCHIP)?;
+        let (max_vertices, max_primitives) = (onchip & 0x7FF, onchip >> 11 & 0x7FF);
+        if max_vertices == 0 || max_primitives == 0 || max_vertices > 256 || max_primitives > 256 {
+            return Err(Malformed("implausible mesh group limits"));
+        }
+        // Row 1 + n, a channel an element: vkd3d-proton links a mesh
+        // stage to the pixel stage by semantic, so the pixel stage's rows
+        // a channel need not be the mesh stage's (32 rows hold no more than
+        // 7 parameters a channel a row).
+        StageIo::Ms(MeshIo {
+            console: true,
+            outputs: exported_params(code)?
+                .into_iter()
+                .map(|n| VsOutput {
+                    usage: Usage::Generic,
+                    row: 1 + n,
+                    param: n,
+                    fp16: false,
+                    pack2: false,
+                })
+                .collect(),
+            clip_cntl: 0,
+            threads: max_vertices.max(max_primitives).next_multiple_of(64),
+            max_vertices,
+            max_primitives,
+            topology: 2,
+            lds_bytes: (rsrc2 >> 19 & 0xFF) * 512,
+        })
+    } else {
+        StageIo::Vs {
+            inputs: Vec::new(),
+            outputs: exported_params(code)?
+                .into_iter()
+                .map(|n| VsOutput {
+                    usage: CHANNEL_ROWS,
+                    row: 1 + 4 * n,
+                    param: n,
+                    fp16: false,
+                    pack2: false,
+                })
+                .collect(),
+        }
+    };
+    Ok(NativeProgram {
+        stage: if pixel {
+            HwStage::Ps
+        } else if mesh {
+            HwStage::Ms
+        } else {
+            HwStage::Vs
+        },
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io,
+        code: code.to_vec(),
+    })
+}
+
+/// `ISG1`/`OSG1` of `(name, index, system value, component type, row,
+/// mask)` elements (component type 1 uint, 3 float; row `u32::MAX` for
+/// none).
+fn signature_part(elements: &[(&str, u32, u32, u32, u32, u8)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend((elements.len() as u32).to_le_bytes());
+    out.extend(8u32.to_le_bytes());
+    let mut name_at = 8 + 32 * elements.len() as u32;
+    let mut names = Vec::new();
+    for &(name, index, system, comp, row, mask) in elements {
+        for v in [0, name_at, index, system, comp, row] {
+            out.extend(v.to_le_bytes());
+        }
+        out.extend([mask, mask, 0, 0]);
+        out.extend(0u32.to_le_bytes());
+        name_at += name.len() as u32 + 1;
+        names.extend(name.as_bytes());
+        names.push(0);
+    }
+    out.extend(names);
+    out
+}
+
+/// A container for one stage of a console graphics pipeline: an `ACCC`
+/// part with the `FSPX` blob [`fspx_program`] reads ([`fspx_graphics`]),
+/// and the signatures its fixed linkage gives (`TEXCOORD<4n + c>` for
+/// channel c of parameter n; the pixel stage's targets by `SPI_SHADER_COL_FORMAT`, its depth by
+/// `DB_SHADER_CONTROL`).
+pub fn fspx_graphics_container(packet: &[u8], stage: u32, code: &[u8], meta: &[u8]) -> Result<Vec<u8>, ShaderError> {
+    let program = fspx_graphics(packet, stage, code, meta)?;
+    let stage_word = stage.to_le_bytes();
+    let parts = [(FSPX_PACKET, packet), (FSPX_STAGE, &stage_word[..]), (FSPX_CODE, code), (FSPX_METADATA, meta)];
+    let mut offset = FSPX_HEADER + 16 * parts.len();
+    let total = offset + parts.iter().map(|(_, d)| d.len().next_multiple_of(4)).sum::<usize>();
+    let mut blob = Vec::with_capacity(total);
+    blob.extend_from_slice(b"FSPX");
+    for word in [FSPX_VERSION, parts.len() as u32, total as u32] {
+        blob.extend_from_slice(&word.to_le_bytes());
+    }
+    for (kind, data) in parts {
+        for word in [kind, offset as u32, data.len() as u32, 0] {
+            blob.extend_from_slice(&word.to_le_bytes());
+        }
+        offset += data.len().next_multiple_of(4);
+    }
+    for (_, data) in parts {
+        blob.extend_from_slice(data);
+        blob.resize(blob.len().next_multiple_of(4), 0);
+    }
+    // One element and row a channel (`TEXCOORD<4n + c>`, [`CHANNEL_ROWS`]).
+    let channels = |n: u8, row: u8| {
+        (0..4u8).map(move |c| ("TEXCOORD", 4 * u32::from(n) + u32::from(c), 0, 3, u32::from(row + c), 1 << c))
+    };
+    let (inputs, outputs) = match &program.io {
+        StageIo::Vs { outputs, .. } => {
+            let mut o = vec![("SV_Position", 0, 1, 3, 0, 0xF)];
+            o.extend(outputs.iter().flat_map(|v| channels(v.param, v.row)));
+            (vec![("SV_VertexID", 0, 6, 1, 0, 1)], o)
+        }
+        StageIo::Ms(ms) => {
+            let mut o = vec![("SV_Position", 0, 1, 3, 0, 0xF)];
+            o.extend(ms.outputs.iter().flat_map(|v| {
+                (0..4u8).map(move |c| ("TEXCOORD", 4 * u32::from(v.param) + u32::from(c), 0, 3, u32::from(v.row), 1 << c))
+            }));
+            (Vec::new(), o)
+        }
+        StageIo::Ps { inputs, db_shader_control, .. } => {
+            let mut i = vec![("SV_Position", 0, 1, 3, 0, 0xF)];
+            i.extend(inputs.iter().flat_map(|p| channels(p.attr, p.row)));
+            let shift = if stage & FSPX_MESH_PIPELINE != 0 { 4 * GFX_MESH_SHIFT } else { 0 };
+            let formats = u32_at(packet, GFX_COL_FORMAT + shift)?;
+            let mut o: Vec<_> = (0..8u32)
+                .filter(|n| formats >> (4 * n) & 0xF != 0)
+                .map(|n| ("SV_Target", n, 64, 3, n, 0xF))
+                .collect();
+            if db_shader_control & 1 != 0 {
+                o.push(("SV_Depth", 0, 65, 3, u32::MAX, 1));
+            }
+            (i, o)
+        }
+        _ => unreachable!("a graphics stage"),
+    };
+    let (isg1, osg1) = (signature_part(&inputs), signature_part(&outputs));
+    Ok(crate::dxbc::build(&[
+        (crate::FourCC::ACCC, &blob),
+        (crate::FourCC::ISG1, &isg1),
+        (crate::FourCC::OSG1, &osg1),
+    ]))
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -922,6 +1268,7 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         .ok_or(Malformed("stage data out of bounds"))?;
     let half = |at: usize| u32::from(u16::from_le_bytes([info[at], info[at + 1]]));
     Ok(StageIo::Ms(MeshIo {
+        console: false,
         outputs,
         clip_cntl: u32_at(data, MS_CLIP_CNTL)?,
         threads: half(0),
@@ -1289,6 +1636,7 @@ mod tests {
         assert_eq!(
             p.io,
             StageIo::Ms(MeshIo {
+                console: false,
                 outputs: vec![out(1, 0), out(0, 0x82)],
                 clip_cntl: 0x0040_000F,
                 threads: 128,
