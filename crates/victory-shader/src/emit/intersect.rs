@@ -211,16 +211,21 @@ impl<'a> Lower<'a> {
         let mut at = at;
         // (Not in pixel shaders: helper lanes may take no part in wave
         // operations; see [`Lower::memory_waterfall`].)
+        // The loop holds the test: each round the lanes still in it whose
+        // node is in the first one's copy are tested and leave at the latch.
+        // (It first left to the test from its header: the host then ran the
+        // test once, after the loop, for all lanes, with the first lane's
+        // view, and a ray whose node lay in another copy read that copy at
+        // its own offset. See `lower.rs` `WATERFALL_SHARED`.)
         let waterfall = if let (NodeAt::Memory { slot, low, high, byte, mapped, .. }, false) = (at, self.s.pixel) {
-            let (header, body, back) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+            let (header, body, latch) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
             let c = self.cur;
             self.s.m.terminate(c, Term::Br(header));
             self.s.flags |= flags::WAVE_OPS;
             let i32t = self.s.t.i32;
             let first = self.s.op(header, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[slot]);
             let mine = self.s.m.cmp(header, pred::EQ, slot, first);
-            self.s.m.terminate(header, Term::CondBr(mine, body, back));
-            self.s.m.terminate(back, Term::Br(header));
+            self.s.m.terminate(header, Term::CondBr(mine, body, latch));
             self.cur = body;
             let handle = self.bvh_handle(first, false);
             at = NodeAt::Memory {
@@ -231,9 +236,9 @@ impl<'a> Lower<'a> {
                 high,
                 mapped,
             };
-            true
+            Some((header, latch, mine))
         } else {
-            false
+            None
         };
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
@@ -275,11 +280,17 @@ impl<'a> Lower<'a> {
             );
             results.push((phi, outside[k]));
         }
-        if waterfall {
-            // (Out of the waterfall's loop: reached from its body alone.)
+        if let Some((header, latch, mine)) = waterfall {
+            // Out of the loop at its latch, with each lane's results.
             let exit = self.s.m.new_block();
-            let c = self.cur;
-            self.s.m.terminate(c, Term::Br(exit));
+            let end = self.cur;
+            self.s.m.terminate(end, Term::Br(latch));
+            for r in &mut results {
+                let (phi, none) = (self.s.m.phi(latch, i32t), self.s.m.undef(i32t));
+                self.s.m.set_phi(phi, vec![(r.0, end), (none, header)]);
+                r.0 = phi;
+            }
+            self.s.m.terminate(latch, Term::CondBr(mine, exit, header));
             self.cur = exit;
         }
         let results = self.end_guarded(gate, &results);

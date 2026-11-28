@@ -3900,6 +3900,7 @@ impl<'a> Lower<'a> {
         self.memory_handle_at(slot, true)
     }
 
+    // (See `WATERFALL_SHARED` below.)
     /// Code that reads or writes title memory through the view at heap slot
     /// `slot` ([`Self::memory_slot`]), made by `body` given the view: run
     /// once per slot the wave's lanes name (a waterfall over
@@ -3910,26 +3911,40 @@ impl<'a> Lower<'a> {
     /// used after the loop as it is (the loop is left from its end alone).
     /// In pixel shaders, whose helper lanes may take no part in wave
     /// operations, the view is given per lane.
-    pub(super) fn memory_waterfall<T>(&mut self, slot: V, body: impl FnOnce(&mut Self, V) -> T) -> T {
-        if self.s.pixel {
+    pub(super) fn memory_waterfall(&mut self, slot: V, body: impl FnOnce(&mut Self, V) -> Vec<V>) -> Vec<V> {
+        if self.s.pixel || !WATERFALL_SHARED {
             let h = self.memory_handle(slot);
             return body(self, h);
         }
-        let (header, inner, back) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        // A loop that holds its body: each round the lanes still in it that
+        // name the first one's slot run the body and leave at the latch, the
+        // others go round again. (With the body after the loop, entered from
+        // the header, the host ran it once for all lanes with the first
+        // lane's view: see `WATERFALL_SHARED`.)
+        let (header, inner) = (self.s.m.new_block(), self.s.m.new_block());
+        let (latch, exit) = (self.s.m.new_block(), self.s.m.new_block());
         let c = self.cur;
         self.s.m.terminate(c, Term::Br(header));
         self.s.flags |= flags::WAVE_OPS;
         let i32t = self.s.t.i32;
         let first = self.s.op(header, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[slot]);
         let mine = self.s.m.cmp(header, pred::EQ, slot, first);
-        self.s.m.terminate(header, Term::CondBr(mine, inner, back));
-        self.s.m.terminate(back, Term::Br(header));
+        self.s.m.terminate(header, Term::CondBr(mine, inner, latch));
         self.cur = inner;
         let h = self.memory_handle_at(first, false);
-        let out = body(self, h);
-        let exit = self.s.m.new_block();
-        let c = self.cur;
-        self.s.m.terminate(c, Term::Br(exit));
+        let made = body(self, h);
+        let end = self.cur;
+        self.s.m.terminate(end, Term::Br(latch));
+        let out = made
+            .into_iter()
+            .map(|v| {
+                let ty = self.s.m.type_of(v);
+                let (phi, none) = (self.s.m.phi(latch, ty), self.s.m.undef(ty));
+                self.s.m.set_phi(phi, vec![(v, end), (none, header)]);
+                phi
+            })
+            .collect();
+        self.s.m.terminate(latch, Term::CondBr(mine, exit, header));
         self.cur = exit;
         out
     }
@@ -4081,6 +4096,7 @@ impl<'a> Lower<'a> {
                 args.push(mask);
                 args.push(align);
                 l.s.op(l.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+                Vec::new()
             });
             self.end_guarded(at, &[]);
             return Ok(());
@@ -4125,14 +4141,14 @@ impl<'a> Lower<'a> {
         let was = self.memory_waterfall(slot, |l, h| match simple {
             Some((code, x)) => {
                 let code = l.s.m.i32(code);
-                l.s.op(
+                vec![l.s.op(
                     l.cur,
                     "atomicBinOp.i32",
                     Attr::NoUnwind,
                     i32t,
                     78,
                     &[h, code, byte, iu, iu, x],
-                )
+                )]
             }
             None => {
                 // A float minimum or maximum has no atomic operation on
@@ -4184,9 +4200,9 @@ impl<'a> Lower<'a> {
                 l.s.m.set_phi(seen, vec![(first, head), (found, pass)]);
                 l.s.m.set_phi(n, vec![(zero, head), (n1, pass)]);
                 l.cur = done;
-                found
+                vec![found]
             }
-        });
+        })[0];
         let was = self.end_guarded(at, &[(was, old)])[0];
         if let Some(reg) = back {
             self.write(inst, Reg::V(reg), was, None);

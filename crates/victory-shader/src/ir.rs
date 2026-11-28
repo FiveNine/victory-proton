@@ -126,10 +126,46 @@ impl Inst {
     }
 }
 
+/// The console's program that clones a ray-tracing structure, with a bound
+/// on what it copies; `None` for any other program.
+///
+/// It copies `(total + 1) * 64` bytes from the source to the target, `total`
+/// being the dword at byte 4 of the source: the node count of a structure's
+/// header. The console only ever clones structures. Here a build that went
+/// wrong leaves a count of tens of millions in a header, and the clone that
+/// follows copies gigabytes over everything behind its target (of 1,083
+/// clones in a run 123 had a count over 64 MiB; the structures of the
+/// title's scene decayed from one of its scene changes to the next).
+///
+/// The program computes the byte count in `s26` (`s_lshl_b32 s26, s24, 6`,
+/// `s_add_i32 s26, s26, 64`) and its copy loop, entered at the second of
+/// three `s_nop`s, compares against it each round. The last two `s_nop`s
+/// become `s_lshr_b32 s27, s24, 20` (SCC: the count is 2^20 nodes, 64 MiB,
+/// or more) and `s_cselect_b32 s26, 0, s26`: such a clone ends after its
+/// first round (each thread's first 16 bytes, 256 KiB in all at most).
+fn bound_clone(code: &[u8]) -> Option<Vec<u8>> {
+    const COUNT: [u32; 3] = [0x8F1A_8618, 0x811A_C01A, 0x7DA8_021A];
+    const NOP: u32 = 0xBF80_0000;
+    const BOUND: [u32; 2] = [0x901B_9418, 0x851A_1A80];
+    let word = |i: usize| code.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let at = (0..code.len() / 4).find(|&i| (0..3).all(|k| word(i + k) == Some(COUNT[k])))?;
+    // (The loop's head: its entry is the branch to the second nop.)
+    if (12..=14).any(|k| word(at + k) != Some(NOP)) {
+        return None;
+    }
+    let mut out = code.to_vec();
+    for (k, w) in BOUND.iter().enumerate() {
+        out[(at + 13 + k) * 4..(at + 14 + k) * 4].copy_from_slice(&w.to_le_bytes());
+    }
+    Some(out)
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
+    let bounded = bound_clone(code);
+    let code = bounded.as_deref().unwrap_or(code);
     let mut list = gfx10::decode(code)?;
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
