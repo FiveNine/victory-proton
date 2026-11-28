@@ -26,6 +26,8 @@ mod texlate;
 mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod gpuprof;
 #[cfg(windows)]
 mod compose;
 pub mod console;
@@ -95,6 +97,12 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod slottrap;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod clockscan;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod physmap;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;

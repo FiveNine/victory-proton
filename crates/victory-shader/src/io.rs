@@ -296,7 +296,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     && i.name() != "v_readfirstlane_b32"
                     && (i.write(Reg::V(5)).is_none() || operand_reads(p, i).contains(&Reg::V(5)))
             });
-            if let Some(i) = per_lane {
+            // The console path's mesh programs (`native::fspx_graphics`) take
+            // it the same in every lane: their first wave shifts it in every
+            // lane and stores it to LDS from all of them for the others.
+            let console = ms.console;
+            if let Some(i) = per_lane.filter(|_| !console) {
                 return Err(unsupported(
                     i.machine.offset,
                     "the mesh group input read per lane",
@@ -322,7 +326,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             .find(|i: &&PsInput| i.attr == index)
             .map(|i| Attribute {
                 usage: i.usage,
-                row: i.row,
+                // One row a channel ([`crate::native::CHANNEL_ROWS`]).
+                row: if i.usage == crate::native::CHANNEL_ROWS { i.row + chan } else { i.row },
                 channel: chan,
                 high,
             })
@@ -836,6 +841,7 @@ mod tests {
                 layout: vec![],
                 used: vec![],
                 io: StageIo::Ms(crate::native::MeshIo {
+                    console: false,
                     outputs: vec![],
                     clip_cntl: 0,
                     threads: 128,

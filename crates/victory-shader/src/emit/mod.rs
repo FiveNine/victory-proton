@@ -130,7 +130,7 @@ pub use bitcode::opt as passes;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_HEAP_START, USER_VERTEX_BUFFER, SLOT_VERTEX, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -336,6 +336,28 @@ fn parse_shader_opt(value: Option<&str>) -> Option<u32> {
         .map(|n| n & bitcode::opt::ALL)
 }
 
+/// The iteration count after which a loop that walks a ray-tracing
+/// structure is left (`lower.rs` `walks`), unless `VICTORY_SHADER_LOOP_LIMIT`
+/// sets every limit: `VICTORY_WALK_LIMIT` (diagnostics builds), else
+/// [`DEFAULT_WALK_LIMIT`]. Part of the translation.
+///
+/// Rays sent through structures the builder did not get right (pointers
+/// into memory that holds no nodes: 600-2,000 such pages a frame) walked
+/// on to the limit of other compute loops, 4,096 steps, and held their
+/// whole wave there. RT, RX 9070 XT, 2026-11-26: cinematic 10.6 -> 13.6 fps
+/// at 1,024 (15.0 at 512), the world after it 15.9 -> 19.4.
+pub const DEFAULT_WALK_LIMIT: u32 = 1 << 10;
+
+pub fn walk_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let asked = cfg!(feature = "diagnostics")
+            .then(|| std::env::var("VICTORY_WALK_LIMIT").ok().and_then(|v| v.trim().parse::<u32>().ok()))
+            .flatten();
+        asked.filter(|&n| n > 0).unwrap_or(DEFAULT_WALK_LIMIT)
+    })
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -440,6 +462,21 @@ pub struct UserData {
 /// make is translated once more with them leaving at the kill, as before
 /// (`structure::without_live_quads`): 13 of the title's programs.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    // (Diagnostics) `VICTORY_CMP_FORCE=<name part>:<value>`: in programs whose
+    // container names that part, every comparison sample reads the value.
+    let forced = std::env::var("VICTORY_CMP_FORCE").ok().and_then(|v| {
+        let (part, value) = v.rsplit_once(':')?;
+        let value = value.trim().parse::<f32>().ok()?;
+        let named = !part.is_empty() && container.windows(part.len()).any(|w| w == part.as_bytes());
+        named.then_some(value)
+    });
+    lower::FORCE_CMP.set(forced);
+    let out = translate_unforced(container);
+    lower::FORCE_CMP.set(None);
+    out
+}
+
+fn translate_unforced(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_retried(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
             structure::without_live_quads(|| translate_retried(container))
@@ -2025,6 +2062,7 @@ mod tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Ms(crate::native::MeshIo {
+                    console: false,
                 outputs: vec![],
                 clip_cntl: 0,
                 threads: 32,

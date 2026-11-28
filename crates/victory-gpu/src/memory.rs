@@ -86,6 +86,7 @@ const ARENA: u64 = 64 << 20;
 const PIECE: usize = 4096;
 /// Pages held, at most (3 GiB).
 const MOST: usize = 3 << 14;
+
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
 /// The biggest packed structure taken for one.
@@ -104,8 +105,16 @@ const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
 /// pages there are in the first seconds (run light-4).
+///
+/// In all it was 2,048 while structures were not right: the bound was met in
+/// the first minute and what rays touched after it had no copy for the rest
+/// of the run (165 pages a frame, each a hole in the scene for that ray).
+/// With lanes reading their own copies (`victory-shader`, translator version
+/// 14) a run asks for about 3,200 in three minutes and then little more, and
+/// what is left without a copy is about 30 pages a frame that are not the
+/// title's memory at all (2026-11-28).
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 2048;
+const FAULTS_ALL: usize = 16384;
 
 /// Pages taken from the faults in all (`VICTORY_BVH_FAULTS_ALL=<n>`; unset:
 /// [`FAULTS_ALL`]). With ray tracing the bound is met in the first minute
@@ -117,6 +126,190 @@ fn faults_all() -> usize {
         std::env::var("VICTORY_BVH_FAULTS_ALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
     })
 }
+/// Pages that keep faulting: past [`FAULTS_ALL`] a page is still taken once
+/// it has faulted in [`persist`]`.0` frames, up to `.1` such pages. Most
+/// faults are pages a garbage pointer reached once; the cap in all went on
+/// those in the first seconds, and the pages rays read every frame read
+/// zeros for the rest of the run: structures with holes, and ray-traced
+/// light that pulsed from frame to frame indoors.
+/// `VICTORY_FAULT_PERSIST=<frames>,<pages>` (unset or 0 frames: off).
+///
+/// Off by default: with ray tracing's light band (`VICTORY_AMBIENT_RT`) the
+/// room looked better without it, and its 16,384 pages (1 GB more of title
+/// memory and card memory) pushed the PC into swap: frames over 100 ms 8.5%
+/// against 2.4%, the worst 2,052 against 727 ms (2026-11-28). `3,16384` was
+/// the old default.
+fn persist() -> (u32, usize) {
+    static SET: std::sync::OnceLock<(u32, usize)> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_FAULT_PERSIST").unwrap_or_default();
+        let mut n = set.split(',').map(|v| v.trim().parse::<usize>().ok());
+        (n.next().flatten().unwrap_or(0) as u32, n.next().flatten().unwrap_or(16384))
+    })
+}
+
+/// What is made ready from an address a builder dispatch names in its
+/// constants (`VICTORY_BVH_NAMED_KB=<n>`; unset: one page, as before). A
+/// batched build names its structures and scratch memory there and in no
+/// view: past the first page its stores found no copy and were dropped, and
+/// a structure built once kept the holes (dumps of 2026-11-28: of the
+/// instances of structures built at run time 108 named a whole one, 522 one
+/// without its header).
+/// `VICTORY_BVH_GEOMETRY=0`: the index and vertex buffers the leaf
+/// unpacking stage reads are not made ready (as before).
+fn geometry_ready() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_GEOMETRY").is_none_or(|v| v != "0"))
+}
+
+/// (Diagnostics) the first tables read are logged.
+#[cfg(feature = "diagnostics")]
+fn geometry_said() -> bool {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40
+}
+
+/// The geometry records at `table` in title memory, while they look like
+/// D3D12 triangle records (48 bytes: transform, index format, vertex
+/// format, index count, vertex count, index buffer, vertex buffer, stride;
+/// the leaf stage's third view, as 0x134850000 in run geo3):
+/// each one's index buffer and its bytes (0 without one) and vertex buffer
+/// and its bytes.
+fn geometry_records(table: u64) -> Vec<(u64, u64, u64, u64)> {
+    const RECORD: usize = 48;
+    const MOST: usize = 1024;
+    const BIGGEST: u64 = 64 << 20;
+    let title = |a: u64| (1 << 32..1 << 40).contains(&a);
+    let mut out = Vec::new();
+    let mut bytes = [0u8; RECORD];
+    for i in 0..MOST {
+        crate::host::copy_mapped(bytes.as_mut_ptr(), (table as usize + i * RECORD) as *const u8, RECORD, false);
+        let d = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let q = |at: usize| u64::from(d(at)) | u64::from(d(at + 4)) << 32;
+        let (index_format, vertex_format, indices, vertices) = (d(8), d(12), u64::from(d(16)), u64::from(d(20)));
+        let (ib, vb, stride) = (q(24), q(32), q(40));
+        // The title's records carry the console's own format codes (0x35 for
+        // its 16-bit indices, run geo3); the program takes 42 (R32_UINT) for
+        // 32-bit indices and any other for 16-bit ones. A record past the
+        // last has no buffers.
+        let index_size = match (index_format, ib) {
+            (_, 0) => 0,
+            (42, _) => 4,
+            _ => 2,
+        };
+        let _ = vertex_format;
+        if !title(vb)
+            || !(4..=256).contains(&stride)
+            || vertices == 0
+            || vertices >= 1 << 24
+            || indices >= 1 << 26
+            || (index_size > 0 && (!title(ib) || indices == 0))
+        {
+            break;
+        }
+        let ib_len = (indices * index_size).min(BIGGEST);
+        let vb_len = (vertices * stride).min(BIGGEST);
+        out.push((if index_size > 0 { ib } else { 0 }, if index_size > 0 { ib_len } else { 0 }, vb, vb_len));
+    }
+    out
+}
+
+/// The slots the builder was asked structures' compacted sizes into (8-byte
+/// aligned addresses), for [`is_size_slot`].
+static SIZE_SLOTS: std::sync::RwLock<Option<std::collections::HashSet<u64>>> = std::sync::RwLock::new(None);
+
+fn note_size_slot(slot: u64) {
+    let mut set = SIZE_SLOTS.write().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(Default::default);
+    if set.len() > 1 << 16 {
+        set.clear();
+    }
+    set.insert(slot & !7);
+}
+
+/// Whether `[at, at + len)` holds a slot the builder was asked a
+/// structure's compacted size into.
+///
+/// The title copies each answer into read-back memory with a buffer copy
+/// behind the dispatch that writes it, and reads it there once told the
+/// submission ran. A copy into memory without a host copy is done at
+/// submission, on the CPU (`crate::host::place`), before any dispatch of
+/// the submission ran: the title read the slot's previous answer, sized
+/// the clone's target from it, and the clone (which copies the size the
+/// structure has) ran over the structures behind its target. Run ring2,
+/// 2026-11-28: the answer for 0xdaecd1f00 was 0x2a040 and reached title
+/// memory two frames after the question; the title had reserved 0x2300
+/// from the slot's old 0x2280. Such copies are made once the list has run.
+pub(crate) fn is_size_slot(at: u64, len: u64) -> bool {
+    if len == 0 || len > 4096 || !slot_copies_late() {
+        return false;
+    }
+    let set = SIZE_SLOTS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(set) = set.as_ref() else { return false };
+    (at & !7..at + len).step_by(8).any(|a| set.contains(&a))
+}
+
+/// `VICTORY_SLOT_COPY_LATE=0`: copies out of size slots are made at
+/// submission, as before.
+fn slot_copies_late() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_COPY_LATE").is_none_or(|v| v != "0"))
+}
+
+fn named_len() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BVH_NAMED_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(1, |kb| (kb << 10).clamp(1, 16 << 20))
+    })
+}
+
+/// `VICTORY_BVH_TITLE_QUIET=1` (a test): once a page the builder was given to
+/// write a structure in has been taken, what the title's CPU writes there
+/// later no longer goes up over the card's bytes.
+fn title_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TITLE_QUIET").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// The dispatch [`ready`] was last asked about on this thread is a clone
+    /// that is not to run.
+    static REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the dispatch just made ready is a clone refused by the guard
+/// (asked once: it is forgotten).
+pub(crate) fn refused() -> bool {
+    REFUSED.with(|r| r.replace(false))
+}
+
+/// Whether a clone from a source the host has not seen made is left out
+/// (`VICTORY_BVH_CLONE_GUARD=1`).
+fn clone_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_CLONE_GUARD").is_some_and(|v| v == "1"))
+}
+
+/// Whether what the builder's starting stage is given in its table is made
+/// ready (`VICTORY_BVH_TABLES=1`; off: in two runs each way the structures
+/// without a header in the title's scene were 345 and 389 without it, 391
+/// and 226 with it, and only a dozen pages a run came for the tables: the
+/// pages were nearly always there already).
+fn tables_now() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// Whether a structure's header goes up when a builder dispatch names it
+/// and a top-level build's instances go up at its submission ([`Memory::header`];
+/// `VICTORY_BVH_HEADERS=1`, a test; off: the title's CPU does not write those
+/// words, 5 runs of them went up in a run, and the count of structures
+/// without a header did not move).
+fn header_now() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HEADERS").is_some_and(|v| v == "1"))
+}
+
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -180,8 +373,38 @@ struct Memory {
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
+    /// Pages the builder was given to write a structure in (a written view
+    /// outside buffers).
+    built_pages: std::collections::HashSet<u64>,
+    /// Structures the host has seen the builder make: started from a row of
+    /// its starting stage's table, asked for their size (a build that ran
+    /// to its end), or cloned from one of these.
+    known: std::collections::HashSet<u64>,
+    /// Clones seen, and those refused ([`clone_guard`]).
+    clones: (u64, u64),
+    /// Runs of header dwords sent up for a builder dispatch ([`Memory::header`]),
+    /// and pages of instances sent up for a top-level build.
+    headers: u64,
+    instances: u64,
+    /// Structures the builder's starting stage was given in its table, and
+    /// the pages that came for them.
+    started: (u64, u64),
     /// Pages taken from faults.
     faulted: usize,
+    /// Pages that faulted: the frames they did in, and the last.
+    fault_seen: HashMap<u64, (u32, u64)>,
+    /// Pages taken for faulting in several frames, and for a dropped store.
+    persisted: usize,
+    stored: usize,
+    /// Structures whose compacted size the builder was asked for: where the
+    /// size goes ([`Memory::size_of_copy`]).
+    size_slots: HashMap<u64, u64>,
+    /// Copies of structures over 4 MiB readied whole.
+    copies_sized: u64,
+    /// Microseconds readying them, and the longest once, since the last line.
+    sized_us: (u64, u64),
+    /// Microseconds taking faults, and the longest once, since the last line.
+    faults_us: (u64, u64),
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -194,6 +417,8 @@ struct Memory {
     dump: dump::Dump,
     #[cfg(feature = "diagnostics")]
     trace: trace::Trace,
+    #[cfg(feature = "diagnostics")]
+    stages: stages::Stages,
 }
 
 /// Since the last report.
@@ -210,6 +435,9 @@ struct Stats {
     packed: u64,
     packed_bytes: u64,
     gone: u64,
+    /// Geometry records whose index and vertex buffers were made ready for
+    /// the leaf unpacking stage.
+    geometry: u64,
     /// Pages that came for an address in constants, a written view, another
     /// view, a structure named in upload memory.
     came: [u64; 4],
@@ -264,7 +492,20 @@ impl Memory {
             packed_sweep: 0,
             free: Vec::new(),
             open: Default::default(),
+            built_pages: Default::default(),
+            known: Default::default(),
+            clones: (0, 0),
+            headers: 0,
+            instances: 0,
+            started: (0, 0),
             faulted: 0,
+            fault_seen: HashMap::new(),
+            persisted: 0,
+            stored: 0,
+            size_slots: HashMap::new(),
+            copies_sized: 0,
+            sized_us: (0, 0),
+            faults_us: (0, 0),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -273,6 +514,8 @@ impl Memory {
             dump: Default::default(),
             #[cfg(feature = "diagnostics")]
             trace: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            stages: Default::default(),
         })
     }
 
@@ -533,6 +776,9 @@ impl Memory {
             }
             held.looked = frame;
             self.stats.looked += 1;
+            if held.taken != 0 && title_quiet() && self.built_pages.contains(&page) {
+                continue;
+            }
             let wrote = answer
                 .as_ref()
                 .map(|(_, w)| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
@@ -560,6 +806,63 @@ impl Memory {
         self.stats.micros += started.elapsed().as_micros() as u64;
     }
 
+    /// A builder dispatch names the structure at `at`: the dwords of its
+    /// header (64 bytes) that the title's CPU wrote since they were last
+    /// taken go up now.
+    ///
+    /// The console's own code writes a new structure's header on the CPU
+    /// (its version and kind, where its elements and parents lie, its
+    /// compression word; no root yet) and only then records the stages that
+    /// build it; the stages fill in the rest. A page is otherwise taken once
+    /// a frame and named once a list ([`Memory::bring`]), so of the
+    /// structures built in one frame on one page only the first had its
+    /// header on the card: the others kept zeros in those dwords for good
+    /// (trace of 2026-11-28: of 390 builds followed, in 195 they never
+    /// showed), and a ray that left its short stack in one read parent
+    /// pointers from nowhere.
+    fn header(&mut self, at: u64) {
+        const HEADER: usize = 64;
+        let page = at / PAGE;
+        let within = (at % PAGE) as usize;
+        let Some(held) = self.pages.get(&page) else { return };
+        // (A page not yet taken goes up whole when it is.)
+        if held.taken == 0 || within + HEADER > PAGE as usize {
+            return;
+        }
+        let mut title = [0u8; HEADER];
+        crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, HEADER, false);
+        // SAFETY: a page of an arena of ours, under the mutex.
+        let ours = unsafe { std::slice::from_raw_parts_mut((held.at + within) as *mut u8, HEADER) };
+        if *ours == title {
+            return;
+        }
+        let shadow = &self.copies[held.copy];
+        let base = held.at - shadow.span().0 as usize + within;
+        let mut run: Option<usize> = None;
+        for i in 0..=HEADER / 4 {
+            let differs = i < HEADER / 4 && ours[i * 4..i * 4 + 4] != title[i * 4..i * 4 + 4];
+            match (differs, run) {
+                (true, None) => run = Some(i),
+                (false, Some(from)) => {
+                    ours[from * 4..i * 4].copy_from_slice(&title[from * 4..i * 4]);
+                    shadow.resend(base + from * 4, base + i * 4);
+                    self.stats.changed += ((i - from) * 4) as u64;
+                    self.headers += 1;
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The host has seen the structure at `at` made.
+    fn know(&mut self, at: u64) {
+        if self.known.len() > 1 << 18 {
+            self.known.clear();
+        }
+        self.known.insert(at);
+    }
+
     /// The bytes of a packed structure title memory has at `address` by now,
     /// and its first two dwords.
     fn packed_at(&self, address: u64) -> Option<(u64, u64)> {
@@ -585,7 +888,9 @@ impl Memory {
         let Some((len, header)) = self.packed_at(address) else {
             // Anything else: what came since its page was first taken.
             for page in page..=(address + VIEW - 1) / PAGE {
-                if self.pages.get(&page).is_some_and(|h| h.born + YOUNG >= self.frame) {
+                if self.pages.get(&page).is_some_and(|h| h.born + YOUNG >= self.frame)
+                    && !(title_quiet() && self.built_pages.contains(&page))
+                {
                     self.take(page, 0, PAGE as usize, false);
                 }
             }
@@ -670,9 +975,26 @@ impl Memory {
         }
     }
 
+    /// The size of a structure the builder copies (compacts) from `from`: what
+    /// the title read for it from the slot its size was asked into, if that
+    /// is a size over 4 MiB and under 64 MiB. The copy wrote it whole: past
+    /// the 4 MiB readied from a written view its stores were dropped and the
+    /// structure stood cut off (rays went through big geometry).
+    fn size_of_copy(&self, from: u64) -> Option<u64> {
+        if from < 1 << 32 || crate::shadow::in_buffer(from, 1).is_some() {
+            return None;
+        }
+        let slot = *self.size_slots.get(&from)?;
+        let mut b = [0u8; 8];
+        crate::host::copy_mapped(b.as_mut_ptr(), slot as *const u8, 8, false);
+        let len = u64::from_le_bytes(b);
+        (BUILT < len && len <= 64 << 20).then_some(len)
+    }
+
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
+        let mut stores = std::collections::HashSet::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
@@ -680,6 +1002,13 @@ impl Memory {
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
             if page != 0 {
+                // (The shader's marks above the page's number: a store in
+                // bit 31, a program that traces rays in bit 30.)
+                let noted = page;
+                let page = noted & 0x3FFF_FFFF;
+                if noted & 1 << 31 != 0 {
+                    stores.insert(u64::from(page));
+                }
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -689,6 +1018,29 @@ impl Memory {
             return;
         }
         pages.sort_unstable();
+        pages.dedup();
+        // `VICTORY_BVH_STORES=1`: the pages a store found without a copy
+        // (each a dropped store), and whether one was there by then.
+        #[cfg(feature = "diagnostics")]
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_STORES").is_some_and(|v| v == "1"))
+                && !stores.is_empty()
+                && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20000
+            {
+                let mut text = String::new();
+                let mut list: Vec<u64> = stores.iter().copied().collect();
+                list.sort_unstable();
+                for page in list {
+                    let at = page * PAGE;
+                    let held = self.copy_of(page).is_some();
+                    let buffer = crate::shadow::in_buffer(at, 1).is_some();
+                    text += &format!(" {at:#x}{}{}", if held { "+" } else { "" }, if buffer { "b" } else { "" });
+                }
+                tracing::info!("bvh stores: frame {} dropped on{text}", self.frame);
+            }
+        }
         let mut made = 0;
         let all = faults_all();
         for &page in &pages {
@@ -696,10 +1048,34 @@ impl Memory {
             if self.copy_of(page).is_some() {
                 continue;
             }
-            if made < FAULTS && self.faulted < all {
+            // A store that found no page was dropped: the structure it wrote
+            // has a hole until it is written again. Those pages are few and
+            // taken past the cap in all. So is a page that keeps faulting
+            // ([`persist`]).
+            let stored = stores.contains(&page);
+            let (frames, most) = persist();
+            let seen = {
+                if self.fault_seen.len() > 1 << 20 {
+                    self.fault_seen.retain(|_, s| s.0 >= 2);
+                }
+                let frame = self.frame;
+                let e = self.fault_seen.entry(page).or_insert((0, u64::MAX));
+                if e.1 != frame {
+                    *e = (e.0 + 1, frame);
+                }
+                e.0
+            };
+            let kept = frames > 0 && seen >= frames && self.persisted < most;
+            let past_cap = self.faulted >= all;
+            if made < FAULTS && (!past_cap || stored || kept) {
                 if self.map(page) {
                     made += 1;
                     self.faulted += 1;
+                    if past_cap && stored {
+                        self.stored += 1;
+                    } else if past_cap {
+                        self.persisted += 1;
+                    }
                     self.bring(page, page + 1);
                 }
             } else {
@@ -754,6 +1130,13 @@ impl Memory {
         let words = unsafe { std::slice::from_raw_parts(from as *const u64, len / 8) };
         let mut seen = std::collections::HashSet::new();
         for &word in words {
+            #[cfg(feature = "diagnostics")]
+            if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) {
+                if self.dump.descs.0 != self.frame {
+                    self.dump.descs = (self.frame, Default::default());
+                }
+                self.dump.descs.1.insert(word);
+            }
             if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
                 let page = word / PAGE;
                 self.bring(page, page + 1);
@@ -800,6 +1183,9 @@ impl Memory {
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
+        if s.geometry > 0 {
+            tracing::info!(records = s.geometry, "title memory by address: index and vertex buffers made ready for the leaf unpacking stage since the last line");
+        }
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
@@ -832,8 +1218,33 @@ impl Memory {
             s.left as f64 / frames,
             faults_all()
         );
+        tracing::info!(
+            persisted = self.persisted,
+            stored = self.stored,
+            copies_sized = self.copies_sized,
+            sized_ms = self.sized_us.0 as f64 / 1000.0,
+            sized_longest_ms = self.sized_us.1 as f64 / 1000.0,
+            faults_ms = self.faults_us.0 as f64 / 1000.0,
+            faults_longest_ms = self.faults_us.1 as f64 / 1000.0,
+            headers = self.headers,
+            instance_pages = self.instances,
+            started = self.started.0,
+            clones = self.clones.0,
+            clones_refused = self.clones.1,
+            started_pages = self.started.1,
+            "title memory by address: pages taken past the cap in all (for faulting in several frames, for a dropped store); big structures' copies readied whole"
+        );
+        self.sized_us = (0, 0);
+        self.faults_us = (0, 0);
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// Whether a structure over 4 MiB that the builder compacts is readied whole
+/// ([`Memory::size_of_copy`]; `VICTORY_BVH_COPY_WHOLE=0`: not).
+fn copy_whole() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_COPY_WHOLE").is_none_or(|v| v != "0"))
 }
 
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
@@ -892,6 +1303,15 @@ fn close(entry: *mut u32, n: usize, offset: u64) {
 
 /// The offset first: a shader that sees the number sees it too.
 fn fill(entry: *mut u32, n: usize, offset: u64) {
+    // The ray-tracing node test reads a node's 16-byte quarters as such
+    // (`victory_shader::emit` `bvh_node_words`): a page on less than 16
+    // bytes in its copy would read the wrong bytes there.
+    if offset % 16 != 0 {
+        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            tracing::warn!(offset, "a page of title memory lies on less than 16 bytes in its copy");
+        }
+    }
     // SAFETY: an entry of the directory, under the mutex.
     unsafe {
         entry.add(1).write_volatile(offset as u32);
@@ -955,11 +1375,20 @@ pub(crate) fn ready(
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        let started = std::time::Instant::now();
         m.take_faults();
+        let us = started.elapsed().as_micros() as u64;
+        m.faults_us = (m.faults_us.0 + us, m.faults_us.1.max(us));
         m.look_again();
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
+        #[cfg(feature = "diagnostics")]
+        crate::slottrap::frame();
+        #[cfg(feature = "diagnostics")]
+        crate::clockscan::frame(frame);
+        #[cfg(feature = "diagnostics")]
+        m.stages_look(frame);
     }
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
@@ -968,6 +1397,34 @@ pub(crate) fn ready(
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
+    }
+    if builds
+        && asks_size(written, constants, threads)
+        && let [lo, hi, 1, ..] = *constants
+        && let Some(&slot) = written.first()
+    {
+        if m.size_slots.len() > 1 << 16 {
+            m.size_slots.clear();
+        }
+        m.size_slots.insert(u64::from(lo) | u64::from(hi) << 32, slot);
+        note_size_slot(slot);
+        m.know(u64::from(lo) | u64::from(hi) << 32);
+        #[cfg(feature = "diagnostics")]
+        crate::slottrap::arm(slot, u64::from(lo) | u64::from(hi) << 32, frame);
+    }
+    if builds
+        && threads == Some([32, 1, 1])
+        && let [from, to] = *written
+        && copy_whole()
+        && let Some(len) = m.size_of_copy(from)
+        && list.first_use(usize::MAX - (6 << 33) - (to >> 2 & 0x7FFF_FFFF) as usize)
+    {
+        let started = std::time::Instant::now();
+        m.ready(from, len);
+        m.ready(to, len);
+        m.copies_sized += 1;
+        let us = started.elapsed().as_micros() as u64;
+        m.sized_us = (m.sized_us.0 + us, m.sized_us.1.max(us));
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
@@ -988,13 +1445,197 @@ pub(crate) fn ready(
         {
             let at = u64::from(c) | u64::from(high) << 32;
             if named(1, at) {
-                m.ready(at, 1);
+                m.ready(at, if builds { named_len() } else { 1 });
             }
         }
         if builds && (0x0100_0000..0x2000_0000).contains(&c) {
             let at = u64::from(c) << 8;
             if named(1, at) {
-                m.ready(at, 1);
+                m.ready(at, named_len());
+            }
+        }
+    }
+    // The builder's stage that unpacks a streamed structure's leaves (groups
+    // of 1,024 threads, 2,048 leaves a group): it reads each triangle's
+    // indices and corners from the title's own index and vertex buffers,
+    // through 48-byte geometry records (as D3D12's triangles: transform,
+    // index format, vertex format, index count, vertex count, index buffer,
+    // vertex buffer and stride). No view names those buffers, so in the
+    // builder's first frames, when it unpacks hundreds of structures, most
+    // of their pages had no copy: the reads gave 0, the corners came out at
+    // one point, and the unpacking is not done again (run wall3: 498 of
+    // 1,805 structures, the house's walls and floors among them, with most
+    // leaves so). The records are the title's CPU's: what they name is made
+    // ready here.
+    // (Its constants: three zeros, the count, the three axes' scales, 1.)
+    if builds
+        && threads == Some([1024, 1, 1])
+        && geometry_ready()
+        && let [0, 0, 0, _, _, _, _, 1, ..] = *constants
+    {
+        for &table in addresses {
+            if table < 1 << 32 || table >= 1 << 40 || table & 7 != 0 || !named(3, table) {
+                continue;
+            }
+            let records = geometry_records(table);
+            #[cfg(feature = "diagnostics")]
+            if m.stages_on() || geometry_said() {
+                let text: Vec<String> = records.iter().take(4).map(|g| format!("ib {:#x}+{:#x} vb {:#x}+{:#x}", g.0, g.1, g.2, g.3)).collect();
+                let mut raw = [0u32; 24];
+                crate::host::copy_mapped(raw.as_mut_ptr().cast(), table as *const u8, 96, false);
+                let raw: Vec<String> = raw.iter().map(|w| format!("{w:08x}")).collect();
+                tracing::info!(
+                    "bvh geometry: frame {frame} table {table:#x} of views {addresses:x?} constants {constants:x?}: {} records; {}; raw {}",
+                    records.len(),
+                    text.join(", "),
+                    raw.join(" ")
+                );
+            }
+            for (ib, ib_len, vb, vb_len) in records {
+                if ib_len > 0 {
+                    m.ready(ib, ib_len);
+                }
+                m.ready(vb, vb_len);
+                m.stats.geometry += 1;
+            }
+        }
+    }
+    // The builder's clone: two views, both written (the source, the
+    // target), four constants. It copies (source.total + 1) * 64 bytes, the
+    // count read from the source's own header: from a source that is no
+    // structure it copies megabytes to gigabytes over what lies behind the
+    // target (trace of 2026-11-28: 287 of 1,083 clones in a run had such a
+    // source, 123 of them a count over 64 MiB; all at the title's scene
+    // changes, after which the structures of its scene decayed). A clone
+    // whose source the host has not seen made is not run.
+    REFUSED.with(|r| r.set(false));
+    if builds
+        && threads == Some([32, 1, 1])
+        && constants.len() == 4
+        && let [from, to] = *written
+        && addresses.len() == 2
+        && from >= 1 << 32
+        && to >= 1 << 32
+    {
+        let known = m.known.contains(&from) || m.packed.contains_key(&from);
+        m.clones.0 += 1;
+        #[cfg(feature = "diagnostics")]
+        if m.stages_on() {
+            tracing::info!("bvh clone: frame {frame} {from:#x} -> {to:#x} known={known}");
+        }
+        if known {
+            m.know(to);
+        } else if clone_guard() {
+            m.clones.1 += 1;
+            m.known.remove(&to);
+            REFUSED.with(|r| r.set(true));
+        }
+    }
+    // The builder's stage that starts structures: one thread a structure,
+    // each storing a header (its kind, where its elements and parents lie,
+    // empty bounds, no root) at an address it takes from a table of 40-byte
+    // rows (the structure, a place for its bounds, the header's words), with
+    // the count in its first constant and nothing given to write. No view
+    // and no constant names the structures, so a page of theirs that had no
+    // copy yet, or was a title buffer's the builder had not been given,
+    // lost the store, and the stages after it built a structure without
+    // those words: no version, no parents (trace of 2026-11-28: in 195 of
+    // 390 builds followed they never showed; of the structures the title
+    // had in its scene 290 to 390 were such). The rows are the title's
+    // CPU's: what they name is made ready here.
+    if builds
+        && written.is_empty()
+        && threads == Some([32, 1, 1])
+        && let (Some(&table), Some(&n)) = (addresses.first(), constants.first())
+        && (1..=4096).contains(&n)
+        && table >= 1 << 32
+    {
+        const ROW: usize = 40;
+        let mut rows = vec![0u8; n as usize * ROW];
+        for (i, piece) in rows.chunks_mut(PIECE).enumerate() {
+            crate::host::copy_mapped(piece.as_mut_ptr(), (table as usize + i * PIECE) as *const u8, piece.len(), false);
+        }
+        let word = |row: &[u8], at: usize| u64::from_le_bytes([row[at], row[at + 1], row[at + 2], row[at + 3], row[at + 4], row[at + 5], row[at + 6], row[at + 7]]);
+        // (A table of another stage with this shape: its rows name nothing.)
+        let named = |a: u64| (1 << 32..1 << 37).contains(&a);
+        #[cfg(feature = "diagnostics")]
+        if m.stages_on() {
+            let dests: Vec<String> = rows.chunks_exact(ROW).map(|r| format!("{:x}", word(r, 0))).collect();
+            tracing::info!("bvh table: frame {frame} after dispatch {} list {:x} rows {n}: {}", m.stages_n(), std::ptr::from_ref(list) as usize & 0xFF_FFFF, dests.join(" "));
+        }
+        if rows.chunks_exact(ROW).all(|row| named(word(row, 0)) && word(row, 0) & 0xFF == 0) {
+            let before = m.pages.len();
+            for row in rows.chunks_exact(ROW) {
+                let (structure, bounds) = (word(row, 0), word(row, 8));
+                m.know(structure);
+                if !tables_now() {
+                    continue;
+                }
+                m.ready(structure, 64);
+                m.opens(structure);
+                if named(bounds) {
+                    m.ready(bounds, 24);
+                    m.opens(bounds);
+                }
+            }
+            m.started.0 += u64::from(n);
+            m.started.1 += (m.pages.len() - before) as u64;
+        }
+    }
+    if builds && header_now() {
+        // At the submission: what the title's CPU wrote for the dispatch may
+        // not be there yet when it is recorded ([`Memory::land`]).
+        let later = |at: u64| {
+            if list.first_use(usize::MAX - (12 << 33) - (at >> 8 & 0x7FFF_FFFF) as usize) {
+                list.defer_host(move || {
+                    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        m.header(at);
+                    }
+                });
+            }
+        };
+        for (i, &c) in constants.iter().enumerate() {
+            if let Some(&high) = constants.get(i + 1)
+                && (1..=0x1F).contains(&high)
+                && c >= 0x1_0000
+                && c & 0xFF == 0
+            {
+                later(u64::from(c) | u64::from(high) << 32);
+            }
+            if (0x0100_0000..0x2000_0000).contains(&c) {
+                later(u64::from(c) << 8);
+            }
+        }
+        for &at in written.iter().filter(|&&a| a >= 1 << 32 && a & 0xFF == 0) {
+            later(at);
+        }
+        // A top-level build (the structure, its instances and how many of
+        // them in its constants): the instances are the title's CPU's, in a
+        // title buffer, and the part of them on a page the buffer does not
+        // hold whole is in an arena, where it was as old as the page's last
+        // look (dump of 2026-11-28: all 906 instances on such a page
+        // differed from title memory). It goes up whole at the submission.
+        if threads == Some([32, 1, 1])
+            && let [lo, hi, dlo, dhi, _, _, _, n, ..] = *constants
+            && (1..0x20).contains(&hi)
+            && (1..0x20).contains(&dhi)
+            && (1..200_000).contains(&n)
+            && lo & 0xFF == 0
+        {
+            let (from, to) = (u64::from(dlo) | u64::from(dhi) << 32, (u64::from(dlo) | u64::from(dhi) << 32) + u64::from(n) * 64);
+            if crate::shadow::in_buffer(from, 1).is_some() && list.first_use(usize::MAX - (13 << 33) - (from >> 8 & 0x7FFF_FFFF) as usize) {
+                list.defer_host(move || {
+                    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        for page in from / PAGE..=(to - 1) / PAGE {
+                            if m.pages.get(&page).is_some_and(|h| h.taken != 0) {
+                                let a = from.max(page * PAGE) - page * PAGE;
+                                let b = to.min((page + 1) * PAGE) - page * PAGE;
+                                m.take(page, a as usize, b as usize, true);
+                                m.instances += 1;
+                            }
+                        }
+                    }
+                });
             }
         }
     }
@@ -1047,6 +1688,13 @@ pub(crate) fn ready(
                 let before = held(m);
                 m.ready(at, BUILT);
                 came[1] += held(m).saturating_sub(before);
+                if title_quiet() {
+                    for page in at / PAGE..=(at + BUILT - 1) / PAGE {
+                        if m.pages.contains_key(&page) {
+                            m.built_pages.insert(page);
+                        }
+                    }
+                }
             }
         }
         if packed || !named(2, at) {
@@ -1104,6 +1752,35 @@ pub(crate) fn ready(
     #[cfg(feature = "diagnostics")]
     if use_ == Use::Reads {
         m.dump.walked(addresses);
+    }
+    #[cfg(feature = "diagnostics")]
+    if builds {
+        m.stages(list, frame, addresses, written, constants, threads);
+    }
+    #[cfg(feature = "diagnostics")]
+    if builds
+        && threads == Some([32, 1, 1])
+        && let [lo, hi, dlo, dhi, _, _, _, n, ..] = *constants
+        && (1..0x20).contains(&hi)
+        && (1..0x20).contains(&dhi)
+        && (1..200_000).contains(&n)
+        && lo & 0xFF == 0
+    {
+        m.dump.tops.insert(u64::from(lo) | u64::from(hi) << 32, (u64::from(dlo) | u64::from(dhi) << 32, n, frame));
+        // The structures its instances name, as title memory has them now.
+        if m.stages_on() && list.first_use(usize::MAX - (11 << 33) - (lo >> 8) as usize) {
+            let at = u64::from(dlo) | u64::from(dhi) << 32;
+            let mut bytes = vec![0u8; n as usize * 64];
+            for (i, piece) in bytes.chunks_mut(PIECE).enumerate() {
+                crate::host::copy_mapped(piece.as_mut_ptr(), (at as usize + i * PIECE) as *const u8, piece.len(), false);
+            }
+            for desc in bytes.chunks_exact(64) {
+                let named = u64::from_le_bytes([desc[56], desc[57], desc[58], desc[59], desc[60], desc[61], desc[62], desc[63]]) & !0xFF;
+                if named != 0 {
+                    m.stages_named(named);
+                }
+            }
+        }
     }
     let directory = &m.directory.1;
     Some(Ready {
@@ -1208,6 +1885,243 @@ mod trace {
     }
 }
 
+/// `VICTORY_BVH_STAGES=<frames>,<structures>`: so many frames after the
+/// builder's first dispatch, the first
+/// so many structures the builder is newly given to write are followed: the
+/// 64 bytes at each one's address (its header) as the card holds them before
+/// every builder dispatch that names it, and before the first of each frame, logged when they change, with the dispatch they changed
+/// before. To see which stage writes a header and which writes over it.
+#[cfg(feature = "diagnostics")]
+mod stages {
+    use super::*;
+
+    const SLOTS: u32 = 1 << 18;
+    /// Frames a structure is looked at once a frame after it is first
+    /// seen, and frames every dispatch that names it is.
+    const WATCH: u64 = 12;
+    const CLOSE: u64 = 4;
+
+    #[derive(Default)]
+    pub(super) struct Stages {
+        to: Option<(ID3D12Resource, usize)>,
+        next: u32,
+        /// Structures still watched: the address and the frame it was
+        /// first given in.
+        recent: Vec<(u64, u64)>,
+        seen: std::collections::HashSet<u64>,
+        named: std::collections::HashSet<u64>,
+        /// Structures looked at once a frame for the rest of the run.
+        long: Vec<u64>,
+        /// Due frame, slot, structure, whether it is said unchanged too,
+        /// what the dispatch was.
+        pending: std::collections::VecDeque<(u64, u32, u64, bool, String)>,
+        last: HashMap<u64, [u8; 64]>,
+        /// The frame whose first dispatch was taken; dispatches counted.
+        frame: u64,
+        n: u64,
+        /// The frame of the builder's first dispatch.
+        began: u64,
+    }
+
+    fn set() -> Option<(u64, usize)> {
+        settings().map(|s| (s.0, s.1))
+    }
+
+    /// `VICTORY_BVH_STAGES=<frames>,<frames>[,<structures>]`: the third, how
+    /// many structures the instances name are watched once a frame for the
+    /// rest of the run (unset: 160).
+    fn settings() -> Option<(u64, usize, usize)> {
+        static SET: std::sync::OnceLock<Option<(u64, usize, usize)>> = std::sync::OnceLock::new();
+        *SET.get_or_init(|| {
+            let v = std::env::var("VICTORY_BVH_STAGES").ok()?;
+            let mut n = v.split(',').map(|x| x.trim().parse::<u64>().ok());
+            Some((
+                n.next().flatten()?,
+                n.next().flatten().unwrap_or(16) as usize,
+                n.next().flatten().unwrap_or(160) as usize,
+            ))
+        })
+    }
+
+    static STAGE: Mutex<String> = Mutex::new(String::new());
+
+    /// The builder pipeline whose dispatch is being recorded.
+    pub(crate) fn note(name: &str) {
+        if set().is_some() {
+            let mut s = STAGE.lock().unwrap_or_else(|e| e.into_inner());
+            s.clear();
+            s.extend(name.chars().take(120));
+        }
+    }
+
+    impl Memory {
+        pub(super) fn stages_look(&mut self, frame: u64) {
+            let Some((_, data)) = self.stages.to else { return };
+            while self.stages.pending.front().is_some_and(|p| p.0 <= frame) {
+                let Some((_, slot, at, always, what)) = self.stages.pending.pop_front() else { break };
+                let mut now = [0u8; 64];
+                // SAFETY: inside the mapping; the copy ran frames ago.
+                unsafe { std::ptr::copy_nonoverlapping((data + slot as usize * 64) as *const u8, now.as_mut_ptr(), 64) };
+                if always || self.stages.last.get(&at) != Some(&now) {
+                    self.stages.last.insert(at, now);
+                    let words: Vec<String> = now.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
+                    tracing::info!("bvh stage: {at:#x} = {} before {what}", words.join(" "));
+                }
+            }
+        }
+
+        pub(super) fn stages_on(&self) -> bool {
+            set().is_some()
+        }
+
+        pub(super) fn stages_n(&self) -> u64 {
+            self.stages.n
+        }
+
+        /// An instance of a top-level build names the structure at `at`.
+        pub(super) fn stages_named(&mut self, at: u64) {
+            let Some((after, long_after)) = set() else { return };
+            let frame = self.frame;
+            if self.stages.began == 0 || frame < self.stages.began + after || !self.stages.named.insert(at) {
+                return;
+            }
+            let known = self.stages.seen.contains(&at);
+            tracing::info!("bvh stage: instance names {at:#x} from frame {frame} written-before={known}");
+            // The first of the builder's own: watched for the rest of the run.
+            if self.stages.long.len() < settings().map_or(160, |s| s.2) && (0xd9..0xdd).contains(&(at >> 28)) && frame >= self.stages.began + long_after as u64 {
+                self.stages.long.push(at);
+            } else {
+                self.stages.recent.push((at, frame));
+            }
+        }
+
+        pub(super) fn stages(
+            &mut self,
+            list: &HostList,
+            frame: u64,
+            addresses: &[u64],
+            written: &[u64],
+            constants: &[u32],
+            threads: Option<[u32; 3]>,
+        ) {
+            let Some((after, _)) = set() else { return };
+            if self.stages.began == 0 {
+                self.stages.began = frame;
+            }
+            let start = self.stages.began + after;
+            if frame < start {
+                self.stages.seen.extend(written);
+                return;
+            }
+            for &w in written {
+                if self.stages.seen.insert(w) && w >= 1 << 32 && w & 0xFF == 0 && crate::shadow::in_buffer(w, 1).is_none() {
+                    self.stages.recent.push((w, frame));
+                }
+            }
+            self.stages.n += 1;
+            let first = std::mem::replace(&mut self.stages.frame, frame) != frame;
+            if first {
+                self.stages.recent.retain(|r| frame <= r.1 + WATCH);
+            }
+            let names = |at: u64| {
+                written.contains(&at)
+                    || addresses.contains(&at)
+                    || constants.iter().any(|&c| u64::from(c) << 8 == at)
+                    || constants.windows(2).any(|c| u64::from(c[0]) | u64::from(c[1]) << 32 == at)
+            };
+            let mut which: Vec<(u64, bool)> = self
+                .stages
+                .recent
+                .iter()
+                .filter_map(|r| {
+                    let close = frame <= r.1 + CLOSE && names(r.0);
+                    (first || close).then_some((r.0, close))
+                })
+                .collect();
+            if first {
+                which.extend(self.stages.long.iter().map(|&at| (at, false)));
+            }
+            // `VICTORY_BVH_STAGE_OF=<hash>[,<hash>...]`: every dispatch of those
+            // stages, what each is given to write (a clone's source and target).
+            static OF: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            if let Some(of) = OF.get_or_init(|| std::env::var("VICTORY_BVH_STAGE_OF").ok())
+                && of.split(',').any(|o| !o.is_empty() && STAGE.lock().unwrap_or_else(|e| e.into_inner()).contains(o))
+            {
+                which.extend(written.iter().filter(|&&w| w >= 1 << 32).map(|&w| (w, true)));
+                // At a clone: the slot its source's compacted size was asked
+                // into, as the card holds it.
+                if let [from, _] = *written
+                    && let Some(&slot) = self.size_slots.get(&from)
+                {
+                    which.push((slot, true));
+                }
+            }
+            if which.is_empty() {
+                return;
+            }
+            if self.stages.to.is_none() {
+                let Some(host) = host() else { return };
+                let Some((to, data)) = host.shared_buffer(u64::from(SLOTS) * 64) else { return };
+                self.stages.to = Some((to, data as usize));
+            }
+            let Some((to, _)) = self.stages.to.clone() else { return };
+            let stage = STAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let what = format!(
+                "frame {frame} list {:x} dispatch {} {threads:?} constants {:x?} written {written:x?} views {addresses:x?} of {stage}",
+                std::ptr::from_ref(list) as usize & 0xFF_FFFF,
+                self.stages.n,
+                &constants[..constants.len().min(8)]
+            );
+            let turn = |buffer: &ID3D12Resource, before, after| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        // SAFETY: the same pointer, not counted; the barrier
+                        // is used while the buffer lives.
+                        pResource: unsafe { std::mem::transmute_copy(buffer) },
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: before,
+                        StateAfter: after,
+                    }),
+                },
+            };
+            let wait = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                },
+            };
+            // SAFETY: an open list; a barrier that names no resource.
+            unsafe { list.list.ResourceBarrier(&[wait]) };
+            for (at, close) in which {
+                let page = at / PAGE;
+                let Some(n) = self.copy_of(page) else { continue };
+                let shadow = &self.copies[n];
+                let offset = match self.pages.get(&page) {
+                    Some(held) => (held.at as u64 - shadow.span().0) + at % PAGE,
+                    None => at - shadow.span().0,
+                };
+                // (A ring: a slot is read 8 frames after it is written.)
+                let slot = self.stages.next % SLOTS;
+                self.stages.next = self.stages.next.wrapping_add(1);
+                // SAFETY: an open list; live buffers; 64 bytes inside both.
+                unsafe {
+                    list.list.ResourceBarrier(&[turn(&shadow.buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    list.list.CopyBufferRegion(&to, u64::from(slot) * 64, &shadow.buffer, offset, 64);
+                    list.list.ResourceBarrier(&[turn(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                self.stages.pending.push_back((frame + 8, slot, at, close, what.clone()));
+            }
+            list.keep(&to);
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) use stages::note as note_stage;
+
 /// `VICTORY_MEMORY_DUMP=<folder>`: when a file `go` appears there, the arenas
 /// as the card holds them are copied out and written (`arena-<n>.bin`), with
 /// `pages.txt` (title page, arena, offset) and the structures the walking
@@ -1222,17 +2136,42 @@ mod dump {
         /// Views the builder was given to write outside buffers: the first
         /// and the last frame, how often.
         pub(super) built: std::collections::BTreeMap<u64, (u64, u64, u64)>,
+        /// The structures upload memory named to the builder in the last
+        /// frame it did (a top-level build's instances).
+        pub(super) descs: (u64, std::collections::BTreeSet<u64>),
+        /// Top-level builds: the structure, where its instances are and how
+        /// many, the frame (a dispatch with both addresses and a count in its
+        /// constants).
+        pub(super) tops: HashMap<u64, (u64, u32, u64)>,
+        /// The instances of each top-level build as title memory held them
+        /// when the copies were recorded: the structure, where they are, how
+        /// many, the frame it was last built in, the bytes. (Read when the
+        /// dump is written, 12 frames later, a structure built or moved in
+        /// between looked like one the instances name and that is not there.)
+        pub(super) taken: Vec<(u64, u64, u32, u64, Vec<u8>)>,
+        /// The frame the copies were recorded in.
+        pub(super) taken_at: u64,
+        /// Packed (streamed) structures as title memory held them when the
+        /// copies were recorded: to compare with the card's (pages the card
+        /// holds as zeros that title memory filled).
+        pub(super) titles: Vec<(u64, Vec<u8>)>,
         /// The frame it is written at, and the copies.
         due: Option<(u64, Vec<(ID3D12Resource, usize)>)>,
-        done: bool,
+        /// Dumps taken so far, and the folder the one being written goes to.
+        taken_n: u32,
+        to: Option<std::path::PathBuf>,
     }
 
     impl Dump {
         pub(super) fn walked(&mut self, addresses: &[u64]) {
-            if !self.done && self.walked.len() < 64 {
+            if self.walked.len() < 64 {
                 self.walked.extend(addresses);
             }
         }
+    }
+
+    fn text_frame(dump: &mut Dump, frame: u64) {
+        dump.taken_at = frame;
     }
 
     fn folder() -> Option<&'static std::path::PathBuf> {
@@ -1266,6 +2205,8 @@ mod dump {
                     return;
                 }
                 let copies = self.dump.due.take().map(|d| d.1).unwrap_or_default();
+                let folder = self.dump.to.take().unwrap_or_else(|| folder.clone());
+                let folder = &folder;
                 let mut text = String::new();
                 for a in &self.dump.walked {
                     text += &format!("walked {a:#x}\n");
@@ -1276,6 +2217,18 @@ mod dump {
                 for (a, p) in &self.packed {
                     text += &format!("packed {a:#x} {} {}\n", p.len, p.frame);
                 }
+                for a in &self.dump.descs.1 {
+                    text += &format!("desc {a:#x} {}\n", self.dump.descs.0);
+                }
+                for (a, bytes) in std::mem::take(&mut self.dump.titles) {
+                    let _ = std::fs::write(folder.join(format!("title-{a:x}.bin")), &bytes);
+                }
+                for (dest, at, n, frame, bytes) in &self.dump.taken {
+                    let _ = std::fs::write(folder.join(format!("instances-{dest:x}.bin")), bytes);
+                    let buffer = crate::shadow::in_buffer(*at, 1);
+                    text += &format!("top {dest:#x} {at:#x} {n} {frame} {buffer:x?}\n");
+                }
+                text += &format!("taken {}\n", self.dump.taken_at);
                 text += &format!("frame {}\n", self.frame);
                 for (page, held) in &self.pages {
                     let arena = self.arenas.iter().position(|a| a.0 == held.copy).unwrap_or(usize::MAX);
@@ -1292,10 +2245,18 @@ mod dump {
                 tracing::info!(arenas = copies.len(), "title memory by address: the arenas are written out");
                 return;
             }
-            if self.dump.done || !folder.join("go").exists() {
+            // A dump each time a file `go` appears (it is taken away): the
+            // first into the folder itself, the next into `2`, `3`... in it.
+            if !folder.join("go").exists() {
                 return;
             }
-            self.dump.done = true;
+            let _ = std::fs::remove_file(folder.join("go"));
+            self.dump.taken_n += 1;
+            let to = if self.dump.taken_n == 1 { folder.clone() } else { folder.join(self.dump.taken_n.to_string()) };
+            let _ = std::fs::create_dir_all(&to);
+            tracing::info!(n = self.dump.taken_n, frame = self.frame, "title memory by address: a dump asked for");
+            self.dump.to = Some(to);
+            self.dump.walked.clear();
             let Some(host) = host() else { return };
             let mut copies = Vec::new();
             for &(n, _) in &self.arenas {
@@ -1311,6 +2272,36 @@ mod dump {
                 list.keep(&to);
                 copies.push((to, data as usize));
             }
+            self.dump.taken = self
+                .dump
+                .tops
+                .iter()
+                .map(|(&dest, &(at, n, frame))| {
+                    let mut bytes = vec![0u8; n as usize * 64];
+                    for (i, piece) in bytes.chunks_mut(PIECE).enumerate() {
+                        crate::host::copy_mapped(piece.as_mut_ptr(), (at as usize + i * PIECE) as *const u8, piece.len(), false);
+                    }
+                    (dest, at, n, frame, bytes)
+                })
+                .collect();
+            // (At most 768 MB of them, and only with
+            // `VICTORY_MEMORY_DUMP_TITLES=1`: they are held in RAM until written.)
+            let mut room: usize = if std::env::var_os("VICTORY_MEMORY_DUMP_TITLES").is_some_and(|v| v == "1") { 768 << 20 } else { 0 };
+            let mut titles = Vec::new();
+            for (&a, p) in &self.packed {
+                let len = p.len as usize;
+                if len > room {
+                    continue;
+                }
+                room -= len;
+                let mut bytes = vec![0u8; len];
+                for (i, piece) in bytes.chunks_mut(PIECE).enumerate() {
+                    crate::host::copy_mapped(piece.as_mut_ptr(), (a as usize + i * PIECE) as *const u8, piece.len(), false);
+                }
+                titles.push((a, bytes));
+            }
+            self.dump.titles = titles;
+            text_frame(&mut self.dump, self.frame);
             self.dump.due = Some((self.frame + 12, copies));
         }
     }

@@ -103,6 +103,17 @@ fn build() -> [u8; 32] {
         };
         bytes.extend_from_slice(&FORMAT.to_le_bytes());
         bytes.extend_from_slice(&limit.to_le_bytes());
+        // (So is the limit of walks through ray-tracing structures; the
+        // default adds nothing, so caches made before it stay good.)
+        let walks = victory_shader::emit::walk_limit();
+        if walks != victory_shader::emit::DEFAULT_WALK_LIMIT {
+            bytes.extend_from_slice(b"walks");
+            bytes.extend_from_slice(&walks.to_le_bytes());
+        }
+        if let Ok(forced) = std::env::var("VICTORY_CMP_FORCE") {
+            bytes.extend_from_slice(b"cmp force");
+            bytes.extend_from_slice(forced.as_bytes());
+        }
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:
@@ -300,6 +311,8 @@ fn root_code(r: RootType) -> u32 {
         RootType::ImmediateSampler => 3,
         RootType::ResourceHeap => 4,
         RootType::SamplerHeap => 5,
+        RootType::VertexTable => 0x8000_0000,
+        RootType::BaseVertex => 0x8000_0001,
         RootType::Other(x) => 6 + x,
     }
 }
@@ -312,6 +325,8 @@ fn root_type(code: u32) -> RootType {
         3 => RootType::ImmediateSampler,
         4 => RootType::ResourceHeap,
         5 => RootType::SamplerHeap,
+        0x8000_0000 => RootType::VertexTable,
+        0x8000_0001 => RootType::BaseVertex,
         x => RootType::Other(x - 6),
     }
 }

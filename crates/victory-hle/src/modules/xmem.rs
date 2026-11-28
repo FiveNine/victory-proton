@@ -661,6 +661,21 @@ impl Shown {
     }
 }
 
+/// (Diagnostics) The physical page `at` shows: its section and index.
+pub fn physical_of(at: usize) -> Option<(usize, usize)> {
+    physical().slice_at(at).map(|s| (Arc::as_ptr(&s.section) as usize, s.index))
+}
+
+/// (Diagnostics) The title addresses that show the same page as `at`
+/// (its 64 KiB page), `at`'s own included; empty if it is in no view.
+pub fn aliases_of(at: usize) -> Vec<usize> {
+    let Some(slice) = physical().slice_at(at) else {
+        return Vec::new();
+    };
+    let within = at % PAGE;
+    SHOWN.read().unwrap_or_else(|e| e.into_inner()).at(&slice).into_iter().map(|(base, _)| base + within).collect()
+}
+
 /// See [`pages_written`].
 pub(crate) fn stream_notice() -> bool {
     static ON: LazyLock<bool> =
@@ -2652,6 +2667,10 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
 }
 
 pub(crate) fn module() -> HleModule {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    victory_gpu::slottrap::set_aliases(aliases_of);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    victory_gpu::physmap::set_physical(physical_of);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],

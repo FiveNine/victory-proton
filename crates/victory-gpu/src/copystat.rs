@@ -1022,6 +1022,30 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    {
+        let m = crate::shadow::merged();
+        if m[0] + m[2] > 0 {
+            tracing::info!(
+                "memory, windows merged: {} asks ({:.0} MB) given a bigger window; {} windows ({:.0} MB) let go into a bigger one",
+                m[0],
+                mb(m[1]),
+                m[2],
+                mb(m[3])
+            );
+        }
+    }
+    {
+        let (pages, shown, distinct) = crate::shadow::window_physical();
+        let mb = |n: u64| (n << 16) as f64 / (1 << 20) as f64;
+        tracing::info!(
+            "memory, windows by physical page: {:.0} MB of window pages, {:.0} MB of them show the title's physical pages, \
+             {:.0} MB of different physical pages ({:.0} MB held more than once through other addresses)",
+            mb(pages),
+            mb(shown),
+            mb(distinct),
+            mb(shown.saturating_sub(distinct))
+        );
+    }
     if memory_categories() {
         let fields: &[(&str, u64)] = &[
             ("working set", working),

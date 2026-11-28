@@ -3044,10 +3044,50 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
+        // The keys each copy stands under (one, unless `window_merge`): held
+        // by the map alone when its count is that.
+        let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for s in map.values() {
+            *keys.entry(Arc::as_ptr(s) as usize).or_default() += 1;
+        }
+        let free = |s: &Arc<Shadow>| Arc::strong_count(s) == keys[&(Arc::as_ptr(s) as usize)] && crate::host::references(&s.buffer) == 1;
+        let mut merged_away: Vec<Arc<Shadow>> = Vec::new();
+        if window_merge() && !tails() && !fine() {
+            // Free windows a bigger one holds whole: their keys to it.
+            let mut seen = std::collections::HashSet::new();
+            let small: Vec<Arc<Shadow>> = map
+                .values()
+                .filter(|s| s.place.is_none() && seen.insert(Arc::as_ptr(s) as usize) && free(s))
+                .cloned()
+                .collect();
+            for s in small {
+                let id = Arc::as_ptr(&s) as usize;
+                let Some(big) = containing(&map, s.start, s.len, Some(id)) else { continue };
+                // (Equal ranges: the one with the lower address keeps them.)
+                if big.len == s.len && (Arc::as_ptr(&big) as usize) > id {
+                    continue;
+                }
+                for v in map.values_mut() {
+                    if Arc::as_ptr(v) as usize == id {
+                        *v = big.clone();
+                    }
+                }
+                WINDOWS_MERGED[2].fetch_add(1, Ordering::Relaxed);
+                WINDOWS_MERGED[3].fetch_add(s.len, Ordering::Relaxed);
+                merged_away.push(s);
+            }
+            if !merged_away.is_empty() {
+                keys.clear();
+                for s in map.values() {
+                    *keys.entry(Arc::as_ptr(s) as usize).or_default() += 1;
+                }
+            }
+        }
+        let free = |s: &Arc<Shadow>| Arc::strong_count(s) == keys[&(Arc::as_ptr(s) as usize)] && crate::host::references(&s.buffer) == 1;
         let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
             .iter()
             .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
+                free(s)
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
@@ -3065,7 +3105,12 @@ pub(crate) fn let_go_idle() {
                 .collect();
             window_victims(&entries, keep)
         };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+        let mut gone: Vec<Arc<Shadow>> = victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect();
+        // (A copy under several keys once.)
+        let mut seen = std::collections::HashSet::new();
+        gone.retain(|s| seen.insert(Arc::as_ptr(s) as usize));
+        gone.extend(merged_away);
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -5437,10 +5482,42 @@ fn fine() -> bool {
 /// over (each byte once), beside the windows' own bytes in
 /// [`memory`]: the difference is memory that is in more than one window,
 /// which is copied once for each.
+/// (Diagnostics) Of the windows' 64 KiB pages: how many, how many show a
+/// physical page (are in a view of the title's), and how many different
+/// physical pages those are.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_physical() -> (u64, u64, u64) {
+    let windows = unique_windows();
+    let (mut pages, mut shown) = (0u64, 0u64);
+    let mut distinct = std::collections::HashSet::new();
+    for (start, bytes) in windows {
+        let mut at = start & !0xFFFF;
+        while at < start + bytes {
+            pages += 1;
+            if let Some(p) = crate::physmap::physical_of(at as usize) {
+                shown += 1;
+                distinct.insert(p);
+            }
+            at += 0x1_0000;
+        }
+    }
+    (pages, shown, distinct.len() as u64)
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
+    let mut windows = unique_windows();
+    windows.sort_unstable();
+    cover(windows.into_iter())
+}
+
+/// (Diagnostics) Each window's own range once (a window may stand under
+/// several keys, `window_merge`).
+#[cfg(feature = "diagnostics")]
+fn unique_windows() -> Vec<(u64, u64)> {
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-    cover(loose.keys().copied())
+    let mut seen = std::collections::HashSet::new();
+    loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| (s.start, s.len)).collect()
 }
 
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
@@ -5638,6 +5715,49 @@ fn committed_reach(from: u64, limit: u64) -> u64 {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// `VICTORY_WINDOW_MERGE=1`: one copy where windows overlap.
+///
+/// An ask that crosses a 4 MiB cell, and every root view (up to
+/// [`root_window_most`]), gets a window of several cells while the cells'
+/// own windows stay: run mem1 (Jason's house) had 5,970 MB of windows over
+/// 3,520 MB of title memory. With this, an ask a bigger window holds whole
+/// takes that window (under its own key, so that the pass bringing a slot
+/// up to date finds the same one); and a window no list and no slot holds
+/// that a bigger one holds whole is let go at the next sweep, its keys
+/// given to the bigger one. A window a slot shows is never moved: the slot
+/// shows its buffer.
+fn window_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_MERGE").is_some_and(|v| v == "1"))
+}
+
+/// Asks given to a bigger window and their bytes; windows let go into a
+/// bigger one and their bytes.
+static WINDOWS_MERGED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// (Diagnostics, the memory line) [`WINDOWS_MERGED`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn merged() -> [u64; 4] {
+    std::array::from_fn(|i| WINDOWS_MERGED[i].load(Ordering::Relaxed))
+}
+
+/// The biggest copy, not in place, other than `but`, whose own range holds
+/// `[start, start + len)`. Windows begin at most [`root_window_most`] (or
+/// one cell) below what they hold.
+fn containing(map: &BTreeMap<(u64, u64), Arc<Shadow>>, start: u64, len: u64, but: Option<usize>) -> Option<Arc<Shadow>> {
+    let reach = root_window_most().max(WINDOW);
+    map.range((start.saturating_sub(reach), 0)..=(start, u64::MAX))
+        .map(|(_, s)| s)
+        .filter(|s| {
+            s.place.is_none()
+                && s.start <= start
+                && s.start + s.len >= start + len
+                && but != Some(Arc::as_ptr(s) as usize)
+        })
+        .max_by_key(|s| (s.len, std::cmp::Reverse(s.start)))
+        .cloned()
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = if unsized_ask && !tails() {
@@ -5700,6 +5820,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
+    }
+    // A bigger window holds all of it already: that one, under this key too
+    // (`window_merge`).
+    if window_merge()
+        && !tails()
+        && !fine()
+        && let Some(shadow) = containing(&map, start, len, None)
+    {
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        WINDOWS_MERGED[0].fetch_add(1, Ordering::Relaxed);
+        WINDOWS_MERGED[1].fetch_add(len, Ordering::Relaxed);
+        return Some(shadow);
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.

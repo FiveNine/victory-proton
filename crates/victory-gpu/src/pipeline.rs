@@ -719,6 +719,92 @@ pub(crate) extern "system" fn create_compute_fspx(
     create_compute(this, &head, iid, out)
 }
 
+/// A stage of device method 0x1c8's description: its code and metadata.
+#[repr(C)]
+pub(crate) struct FspxStage {
+    code: Piece,
+    program: Piece,
+}
+
+/// Device method 0x1c8's description (`DeserializeGraphicsPipelineStateX`
+/// in the kit): the root signature, the pipeline's packet and metadata,
+/// then the pixel, vertex, geometry, export, hull, local and fetch stages.
+#[repr(C)]
+pub(crate) struct FspxGraphicsHead {
+    root: This,
+    packet: Piece,
+    pipeline: Piece,
+    stages: [FspxStage; 7],
+}
+
+/// Device method 0x1c8 (`VICTORY_FSPX_PIPELINES=1`): a graphics pipeline
+/// of console pieces. Each stage becomes a container of its own
+/// ([`victory_shader::native::fspx_graphics_container`]), the state comes
+/// from the packet and metadata ([`host::GraphicsState::from_console`]).
+/// Vertex or mesh, and pixel stages: a pipeline with others is refused.
+pub(crate) extern "system" fn create_graphics_fspx(
+    _this: This,
+    desc: *const FspxGraphicsHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use victory_shader::native::{FSPX_MESH, FSPX_MESH_PIPELINE, FSPX_PIXEL, FSPX_VERTEX, fspx_graphics_container};
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let piece = |p: &Piece| -> Option<&[u8]> {
+        // SAFETY: the title passes `len` bytes at each piece's address.
+        (!p.at.is_null() && p.len > 0 && p.len < 1 << 20).then(|| unsafe { std::slice::from_raw_parts(p.at, p.len) })
+    };
+    let (Some(packet), Some(pipeline)) = (piece(&desc.packet), piece(&desc.pipeline)) else {
+        return E_INVALIDARG;
+    };
+    // 2 geometry (the console's mesh programs), 3 export, 4 hull, 5 local,
+    // 6 fetch.
+    let present: Vec<usize> = (1..7).filter(|&i| piece(&desc.stages[i].code).is_some()).collect();
+    let mesh = present == [2];
+    if !(mesh || present == [1]) {
+        tracing::warn!(?present, "console graphics pipeline of stages other than vertex or mesh, and pixel; refused");
+        return E_INVALIDARG;
+    }
+    let flag = if mesh { FSPX_MESH_PIPELINE } else { 0 };
+    let first = if mesh {
+        (&desc.stages[2], FSPX_MESH | flag, "mesh")
+    } else {
+        (&desc.stages[1], FSPX_VERTEX, "vertex")
+    };
+    let mut shaders = Vec::new();
+    for (stage, kind, name) in [first, (&desc.stages[0], FSPX_PIXEL | flag, "pixel")] {
+        let (Some(code), Some(program)) = (piece(&stage.code), piece(&stage.program)) else {
+            if name != "pixel" {
+                return E_INVALIDARG;
+            }
+            continue;
+        };
+        match fspx_graphics_container(packet, kind, code, program) {
+            Ok(c) => shaders.push(shader(name, &c)),
+            Err(e) => {
+                tracing::warn!(%e, name, "console graphics stage not rebuilt; pipeline refused");
+                return E_INVALIDARG;
+            }
+        }
+    }
+    #[cfg(windows)]
+    let Some(graphics) = host::GraphicsState::from_console(packet, pipeline, mesh) else {
+        return E_INVALIDARG;
+    };
+    #[cfg(not(windows))]
+    let _ = pipeline;
+    hand_out(
+        shaders,
+        #[cfg(windows)]
+        Some(Box::new(graphics)),
+        iid,
+        out,
+    )
+}
+
 /// Whether device method 0x218 makes its pipelines ([`create_compute_fspx`]).
 pub(crate) fn fspx_pipelines() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

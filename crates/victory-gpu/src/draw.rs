@@ -1609,6 +1609,10 @@ impl State {
             }
             // The host's own ([`Self::host_word`]): no root argument.
             (_, RootType::Other(_)) => 0,
+            // A heap's own address: offset 0 of the bound heap, as tables
+            // are given (a program of the console path that indexes the
+            // heap, `victory_shader::native::fspx_program`).
+            (_, RootType::ResourceHeap | RootType::SamplerHeap) => 0,
             _ => {
                 once!(
                     slot,
@@ -1634,9 +1638,31 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        // A console vertex program's vertex buffer `slot`: stride, size.
+        if kind == victory_shader::emit::USER_VERTEX_BUFFER {
+            let v = self.vertex.get(usize::from(slot)).copied().unwrap_or_default();
+            return if dword == 0 { v.stride } else { v.size };
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
+        }
+        // The bound heaps' starts and sizes, for descriptors the shader
+        // loads by address (`victory_shader::emit::USER_HEAP_START`): dwords
+        // 0-1 the view heap's start, 2-3 the sampler heap's, 4 and 5 their
+        // counts.
+        if kind == victory_shader::emit::USER_HEAP_START {
+            let samplers = matches!(dword, 2 | 3 | 5);
+            let h = self.heaps[usize::from(samplers)];
+            if h == 0 {
+                return 0;
+            }
+            let heap = crate::descriptor::heap(h as This);
+            return match dword {
+                0 | 2 => heap.start as u32,
+                1 | 3 => (heap.start >> 32) as u32,
+                _ => heap.count(),
+            };
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
@@ -2048,7 +2074,17 @@ impl State {
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
-                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    // A console vertex program's vertex buffer: the view
+                    // the title set with `IASetVertexBuffers`.
+                    let vertex = slot.checked_sub(victory_shader::emit::SLOT_VERTEX).filter(|&k| srv && k < 16);
+                    let address = match vertex {
+                        Some(k) => Some(self.vertex[usize::from(k)].address).filter(|&a| a != 0).map(Root::View),
+                        None => match self.roots_ref(compute).get(usize::from(slot)) {
+                            Some(&Root::View(a)) => Some(Root::View(a)),
+                            _ => None,
+                        },
+                    };
+                    let Some(Root::View(address)) = address
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
@@ -3219,6 +3255,12 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::memory::note_stage(&p.name);
+        }
+        // (Nothing left over from a dispatch that did not get this far.)
+        let _ = crate::memory::refused();
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3226,6 +3268,11 @@ impl State {
             if crate::pipeline::is_builder(self.pipeline as This) {
                 crate::pipeline::builder_rests("one of its dispatches could not be bound");
             }
+            return;
+        }
+        // (A clone from a source that is no structure: `crate::memory`.)
+        if crate::memory::refused() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -3243,6 +3290,20 @@ impl State {
             .flatten();
         let threads = [x, y, z];
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // (Diagnostics, `VICTORY_BVH_DISPATCHES=1`) the builder's dispatches as given
+        // and as sent: whether a stage runs the groups its work needs.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) && std::env::var_os("VICTORY_BVH_DISPATCHES").is_some() {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 20000 {
+                tracing::info!(
+                    "bvh dispatch: frame {} {} given {threads:?} flags {flags:#x} group {size:?} sent {:?}",
+                    crate::frame::current(),
+                    p.name,
+                    [x, y, z]
+                );
+            }
+        }
         if size.is_some() {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
@@ -3252,8 +3313,39 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let profiled = if crate::gpuprof::on() { crate::gpuprof::before(&list.list, &format!("dispatch {}", p.name)) } else { None };
+        // A stage of the structure builder reads what the stage before it
+        // stored (the header's offsets, counters in scratch memory), and the
+        // console's own code between them is not a call the host sees: with
+        // no barrier the host card may run two stages at once. A test
+        // switch ([`builder_barrier`]): it was not what leaves structures
+        // without a header. The first dispatch after the builder's waits
+        // for it the same way.
+        static AFTER_BUILDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        let key = std::ptr::from_ref(list) as usize;
+        let follows = AFTER_BUILDER.load(Ordering::Relaxed) == key;
+        if builder_barrier() && (builder || follows) {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            // SAFETY: an open list; a barrier that names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            AFTER_BUILDER.store(if builder { key } else { 0 }, Ordering::Relaxed);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(slot) = profiled {
+            crate::gpuprof::after(&list.list, slot);
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.after_dispatch(list, p);
@@ -3765,8 +3857,14 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let profiled = self.profile(list, "mesh");
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(slot) = profiled {
+                        crate::gpuprof::after(&list.list, slot);
+                    }
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4337,11 +4435,17 @@ impl State {
             if count == 3 && instances == 1 {
                 self.record_framegen_camera(list);
             }
+            #[cfg(feature = "diagnostics")]
+            let profiled = self.profile(list, "draw");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(slot) = profiled {
+                crate::gpuprof::after(&list.list, slot);
+            }
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4350,6 +4454,16 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// [`crate::gpuprof::before`] for what the bound pipeline records now.
+    #[cfg(feature = "diagnostics")]
+    fn profile(&self, list: &HostList, what: &str) -> Option<u32> {
+        if !crate::gpuprof::on() {
+            return None;
+        }
+        let name = crate::pipeline::host_pipeline(self.pipeline as This).map_or("?", |p| p.name.as_str());
+        crate::gpuprof::before(&list.list, &format!("{what} {name}"))
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -4442,11 +4556,17 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let profiled = self.profile(list, "indexed");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(slot) = profiled {
+                crate::gpuprof::after(&list.list, slot);
+            }
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4571,6 +4691,16 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        // (Diagnostics) Which of the builder's stages run indirectly.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::memory::note_stage(&p.name);
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.get_or_insert_with(Default::default).insert(p.name.clone()) {
+                tracing::info!(stage = p.name, kind, stride, max, count = count.is_some(), "builder stage run indirectly");
+            }
+        }
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
@@ -4770,6 +4900,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let profiled = self.profile(list, &format!("indirect{kind}"));
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -4782,6 +4914,10 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(slot) = profiled {
+            crate::gpuprof::after(&list.list, slot);
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -5526,4 +5662,20 @@ mod aliased_recheck_tests {
         assert_eq!(next_look(last, false), Some(ALIASED_RECHECK));
         assert_eq!(next_look(last, true), Some(ALIASED_RECHECK));
     }
+}
+
+/// Whether the structure builder's dispatches are kept apart by a barrier
+/// (`VICTORY_BVH_BARRIER=0`: not). Without it the stage that answers a
+/// structure's compacted size could read the structure's header before the
+/// stage building it had stored its node count: the title sized the clone's
+/// target from the smaller answer and the clone, which copies the node
+/// count the header holds by then, ran over the structures behind it (the
+/// room speckled and darkened indoors). Runs ring1/ring2 (2026-11-28, the
+/// size answers as the title's read-back ring held them against the clones'
+/// lengths): clones longer than their target 165 of 1,543 -> 56 of 975, the
+/// frame rate the same within run variance. (An earlier run, before lanes
+/// read their own copies, had no more whole structures with it.)
+fn builder_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BARRIER").is_none_or(|v| v != "0"))
 }

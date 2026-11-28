@@ -103,6 +103,22 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of user-data dwords the host computes: the title
+/// address the bound view heap starts at (`dword` 0 low, 1 high), the
+/// sampler heap's (2, 3), and how many descriptors each holds (4 views, 5
+/// samplers). Console code loads descriptors through addresses it reads
+/// from memory (bindless tables): the shader makes the heap index from
+/// the address (`lower.rs` `memory_heap_index`).
+pub const USER_HEAP_START: u32 = 0x107;
+
+/// Root SRVs `t<SLOT_VERTEX + k>` in [`ROOT_CBV_SPACE`] (k below 16): a
+/// console vertex program's vertex buffer k, raw, from the start of the
+/// view the title binds there (`IASetVertexBuffers`).
+pub const SLOT_VERTEX: u8 = 0xE0;
+/// `RootType::Other` code of user-data dwords the host sets at a draw: the
+/// stride (`dword` 0) and size in bytes (1) of vertex buffer `slot`
+/// ([`SLOT_VERTEX`]).
+pub const USER_VERTEX_BUFFER: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -881,7 +897,10 @@ impl Shader {
                 }
             }
         }
-        if let Some(n) = self.wave_size {
+        // Not for mesh shaders, which DXIL gives no wave size: the console
+        // path's mesh programs assume the host's 64-lane mesh waves
+        // (`lower`, RADV's default).
+        if let Some(n) = self.wave_size.filter(|_| self.mesh.is_none()) {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
             props.push(self.m.md_node(vec![n]));
@@ -981,7 +1000,7 @@ impl Shader {
             geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
-            wave_size: self.wave_size,
+            wave_size: self.wave_size.filter(|_| self.mesh.is_none()),
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
