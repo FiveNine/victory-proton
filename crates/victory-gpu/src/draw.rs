@@ -5629,8 +5629,17 @@ mod aliased_recheck_tests {
 }
 
 /// Whether the structure builder's dispatches are kept apart by a barrier
-/// (`VICTORY_BVH_BARRIER=1`; off: a run with it had no more whole structures, 2 of 31 rebuilt every frame against 12 of 33).
+/// (`VICTORY_BVH_BARRIER=0`: not). Without it the stage that answers a
+/// structure's compacted size could read the structure's header before the
+/// stage building it had stored its node count: the title sized the clone's
+/// target from the smaller answer and the clone, which copies the node
+/// count the header holds by then, ran over the structures behind it (the
+/// room speckled and darkened indoors). Runs ring1/ring2 (2026-11-28, the
+/// size answers as the title's read-back ring held them against the clones'
+/// lengths): clones longer than their target 165 of 1,543 -> 56 of 975, the
+/// frame rate the same within run variance. (An earlier run, before lanes
+/// read their own copies, had no more whole structures with it.)
 fn builder_barrier() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BARRIER").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BARRIER").is_none_or(|v| v != "0"))
 }

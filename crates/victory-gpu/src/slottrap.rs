@@ -68,6 +68,15 @@ pub(crate) fn copied(src: usize, dst: usize, len: usize, how: &str) {
         }
     }
     let hit = !to.is_empty();
+    if ring_watch() && hit {
+        let frame = crate::frame::current();
+        let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+        for &(at, (structure, asked)) in &to {
+            if ring.len() < 8192 {
+                ring.push((at, structure, asked, frame, read_u64(at)));
+            }
+        }
+    }
     // (The copies land in a ring of read-back memory on pages the title's
     // threads use all the time: guarding them crashed the title in its first
     // frame, so they are only logged.)
@@ -80,9 +89,43 @@ pub(crate) fn copied(src: usize, dst: usize, len: usize, how: &str) {
     }
 }
 
+/// Whether `[at, at + len)` holds a slot the builder was asked a size into.
+pub(crate) fn is_slot(at: usize, len: usize) -> bool {
+    if !on() {
+        return false;
+    }
+    let armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(a) = armed.as_ref() else { return false };
+    a.get(&(at & !(PAGE - 1))).is_some_and(|slots| slots.keys().any(|&s| (at..at + len.max(1)).contains(&s)))
+}
+
 pub(crate) fn on() -> bool {
+    trap() || ring_watch()
+}
+
+/// `VICTORY_SLOT_TRAP=1`: the slots' pages are guarded.
+fn trap() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_TRAP").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_RING_WATCH=1`: no guards; the places the title copies the
+/// sizes to (its read-back ring) are read once a frame, and the frame a
+/// new value shows there is logged ("ring: ..."), to compare with the
+/// sizes the title gave the clones' targets.
+fn ring_watch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RING_WATCH").is_some_and(|v| v == "1"))
+}
+
+/// Ring places being watched: address, structure, frame asked, frame
+/// copied, value last read.
+static RING: Mutex<Vec<(usize, u64, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+fn read_u64(at: usize) -> u64 {
+    let mut v = [0u8; 8];
+    crate::host::copy_mapped(v.as_mut_ptr(), at as *const u8, 8, false);
+    u64::from_le_bytes(v)
 }
 
 /// The builder was asked for `structure`'s compacted size into `slot`.
@@ -90,7 +133,9 @@ pub(crate) fn arm(slot: u64, structure: u64, frame: u64) {
     if !on() {
         return;
     }
-    install();
+    if trap() {
+        install();
+    }
     // The slot's own address and every other one that shows its page.
     let mut at = vec![slot as usize];
     if let Some(f) = ALIASES.get() {
@@ -110,8 +155,10 @@ pub(crate) fn arm(slot: u64, structure: u64, frame: u64) {
         armed.get_or_insert_with(HashMap::new).entry(page).or_default().insert(a & !7, (structure, frame));
     }
     drop(armed);
-    for &a in &at {
-        guard(a & !(PAGE - 1));
+    if trap() {
+        for &a in &at {
+            guard(a & !(PAGE - 1));
+        }
     }
 }
 
@@ -124,6 +171,24 @@ pub(crate) fn frame() {
     if FRAMES.fetch_add(1, Ordering::Relaxed) % 300 == 299 {
         let c: Vec<u32> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         tracing::info!("slot trap: guards asked {} set {} refused {}; faults of ours {} of the title's {}", c[0], c[1], c[2], c[3], c[4]);
+    }
+    if ring_watch() {
+        let now = crate::frame::current();
+        let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+        ring.retain(|e| e.3 + 60 >= now);
+        for e in ring.iter_mut() {
+            let v = read_u64(e.0);
+            if v != e.4 {
+                e.4 = v;
+                static SAID: AtomicU32 = AtomicU32::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 200_000 {
+                    tracing::info!("ring: {:#x} for {:#x} asked f{} copied f{}: {v:#x} seen at frame {now}", e.0, e.1, e.2, e.3);
+                }
+            }
+        }
+    }
+    if !trap() {
+        return;
     }
     let pages: Vec<usize> = ARMED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Vec::new(), |a| a.keys().copied().collect());
     for page in pages {

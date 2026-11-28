@@ -265,6 +265,25 @@ impl HostList {
             return false;
         };
         let own = shaders_own(src, len);
+        // (Diagnostics, `VICTORY_RING_WATCH=1`) which way a copy out of a
+        // structure-size slot goes: from the copy shaders wrote, or from
+        // title memory as it is at submission.
+        #[cfg(feature = "diagnostics")]
+        if crate::slottrap::is_slot(src, len) {
+            let peek = crate::shadow::peek(src as u64, len as u64);
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 2000 {
+                tracing::info!(
+                    "ring path: frame {} {src:#x} -> {dst:#x}: {}; the slot's host copy: {}",
+                    crate::frame::current(),
+                    if own.is_some() { "from the copy shaders wrote" } else { "from title memory at submission" },
+                    match &peek {
+                        None => "none".to_owned(),
+                        Some(p) => format!("written {} in place {}", p.written(), p.in_place()),
+                    }
+                );
+            }
+        }
         let scratch = match &own {
             Some(_) => None,
             None if len <= MOST => match self.scratch_at(len as u64) {

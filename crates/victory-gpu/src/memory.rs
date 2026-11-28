@@ -214,6 +214,48 @@ fn geometry_records(table: u64) -> Vec<(u64, u64, u64, u64)> {
     out
 }
 
+/// The slots the builder was asked structures' compacted sizes into (8-byte
+/// aligned addresses), for [`is_size_slot`].
+static SIZE_SLOTS: std::sync::RwLock<Option<std::collections::HashSet<u64>>> = std::sync::RwLock::new(None);
+
+fn note_size_slot(slot: u64) {
+    let mut set = SIZE_SLOTS.write().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(Default::default);
+    if set.len() > 1 << 16 {
+        set.clear();
+    }
+    set.insert(slot & !7);
+}
+
+/// Whether `[at, at + len)` holds a slot the builder was asked a
+/// structure's compacted size into.
+///
+/// The title copies each answer into read-back memory with a buffer copy
+/// behind the dispatch that writes it, and reads it there once told the
+/// submission ran. A copy into memory without a host copy is done at
+/// submission, on the CPU (`crate::host::place`), before any dispatch of
+/// the submission ran: the title read the slot's previous answer, sized
+/// the clone's target from it, and the clone (which copies the size the
+/// structure has) ran over the structures behind its target. Run ring2,
+/// 2026-11-28: the answer for 0xdaecd1f00 was 0x2a040 and reached title
+/// memory two frames after the question; the title had reserved 0x2300
+/// from the slot's old 0x2280. Such copies are made once the list has run.
+pub(crate) fn is_size_slot(at: u64, len: u64) -> bool {
+    if len == 0 || len > 4096 || !slot_copies_late() {
+        return false;
+    }
+    let set = SIZE_SLOTS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(set) = set.as_ref() else { return false };
+    (at & !7..at + len).step_by(8).any(|a| set.contains(&a))
+}
+
+/// `VICTORY_SLOT_COPY_LATE=0`: copies out of size slots are made at
+/// submission, as before.
+fn slot_copies_late() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_COPY_LATE").is_none_or(|v| v != "0"))
+}
+
 fn named_len() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -1363,6 +1405,7 @@ pub(crate) fn ready(
             m.size_slots.clear();
         }
         m.size_slots.insert(u64::from(lo) | u64::from(hi) << 32, slot);
+        note_size_slot(slot);
         m.know(u64::from(lo) | u64::from(hi) << 32);
         #[cfg(feature = "diagnostics")]
         crate::slottrap::arm(slot, u64::from(lo) | u64::from(hi) << 32, frame);
@@ -2112,12 +2155,14 @@ mod dump {
         pub(super) titles: Vec<(u64, Vec<u8>)>,
         /// The frame it is written at, and the copies.
         due: Option<(u64, Vec<(ID3D12Resource, usize)>)>,
-        done: bool,
+        /// Dumps taken so far, and the folder the one being written goes to.
+        taken_n: u32,
+        to: Option<std::path::PathBuf>,
     }
 
     impl Dump {
         pub(super) fn walked(&mut self, addresses: &[u64]) {
-            if !self.done && self.walked.len() < 64 {
+            if self.walked.len() < 64 {
                 self.walked.extend(addresses);
             }
         }
@@ -2158,6 +2203,8 @@ mod dump {
                     return;
                 }
                 let copies = self.dump.due.take().map(|d| d.1).unwrap_or_default();
+                let folder = self.dump.to.take().unwrap_or_else(|| folder.clone());
+                let folder = &folder;
                 let mut text = String::new();
                 for a in &self.dump.walked {
                     text += &format!("walked {a:#x}\n");
@@ -2171,8 +2218,8 @@ mod dump {
                 for a in &self.dump.descs.1 {
                     text += &format!("desc {a:#x} {}\n", self.dump.descs.0);
                 }
-                for (a, bytes) in &self.dump.titles {
-                    let _ = std::fs::write(folder.join(format!("title-{a:x}.bin")), bytes);
+                for (a, bytes) in std::mem::take(&mut self.dump.titles) {
+                    let _ = std::fs::write(folder.join(format!("title-{a:x}.bin")), &bytes);
                 }
                 for (dest, at, n, frame, bytes) in &self.dump.taken {
                     let _ = std::fs::write(folder.join(format!("instances-{dest:x}.bin")), bytes);
@@ -2196,10 +2243,18 @@ mod dump {
                 tracing::info!(arenas = copies.len(), "title memory by address: the arenas are written out");
                 return;
             }
-            if self.dump.done || !folder.join("go").exists() {
+            // A dump each time a file `go` appears (it is taken away): the
+            // first into the folder itself, the next into `2`, `3`... in it.
+            if !folder.join("go").exists() {
                 return;
             }
-            self.dump.done = true;
+            let _ = std::fs::remove_file(folder.join("go"));
+            self.dump.taken_n += 1;
+            let to = if self.dump.taken_n == 1 { folder.clone() } else { folder.join(self.dump.taken_n.to_string()) };
+            let _ = std::fs::create_dir_all(&to);
+            tracing::info!(n = self.dump.taken_n, frame = self.frame, "title memory by address: a dump asked for");
+            self.dump.to = Some(to);
+            self.dump.walked.clear();
             let Some(host) = host() else { return };
             let mut copies = Vec::new();
             for &(n, _) in &self.arenas {
@@ -2227,8 +2282,9 @@ mod dump {
                     (dest, at, n, frame, bytes)
                 })
                 .collect();
-            // (At most 768 MB of them.)
-            let mut room: usize = 768 << 20;
+            // (At most 768 MB of them, and only with
+            // `VICTORY_MEMORY_DUMP_TITLES=1`: they are held in RAM until written.)
+            let mut room: usize = if std::env::var_os("VICTORY_MEMORY_DUMP_TITLES").is_some_and(|v| v == "1") { 768 << 20 } else { 0 };
             let mut titles = Vec::new();
             for (&a, p) in &self.packed {
                 let len = p.len as usize;

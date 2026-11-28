@@ -831,11 +831,23 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// The bytes title memory holds at this address by then (a copy the
+    /// title's list makes out of memory a dispatch of the same submission
+    /// writes: `crate::list` `buffer_copy`).
+    CopyOf(usize),
 }
 
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+        if let Written::CopyOf(from) = self {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::timeline::told("copied when its list had run", at as usize, 0);
+            // (Title memory to title memory; both may be shared with other
+            // threads of the title's, as the copy at submission was.)
+            crate::host::copy_mapped(at, from as *const u8, bytes, true);
+            return;
+        }
         let value = match self {
             Written::Value(v) => v,
             Written::GpuTimestamp => {
@@ -847,6 +859,7 @@ impl Written {
                 as_loaded(now, at as usize, gpu_load())
             }
             Written::SystemTimestamp => system_timestamp(),
+            Written::CopyOf(_) => return,
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::timeline::told("written when its list had run", at as usize, value);

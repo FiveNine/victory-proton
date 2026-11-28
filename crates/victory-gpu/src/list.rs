@@ -871,6 +871,12 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     }
     #[cfg(feature = "diagnostics")]
     crate::slottrap::copied(from as usize, to as usize, len, "buffer");
+    // Out of a structure-size slot: once the list has run, behind the
+    // builder's answer (`crate::memory::is_size_slot`).
+    if crate::memory::is_size_slot(from as u64, len as u64) {
+        list.defer_write(to, crate::queue::Written::CopyOf(from as usize), len);
+        return;
+    }
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
     } else {
