@@ -462,6 +462,21 @@ pub struct UserData {
 /// make is translated once more with them leaving at the kill, as before
 /// (`structure::without_live_quads`): 13 of the title's programs.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    // (Diagnostics) `VICTORY_CMP_FORCE=<name part>:<value>`: in programs whose
+    // container names that part, every comparison sample reads the value.
+    let forced = std::env::var("VICTORY_CMP_FORCE").ok().and_then(|v| {
+        let (part, value) = v.rsplit_once(':')?;
+        let value = value.trim().parse::<f32>().ok()?;
+        let named = !part.is_empty() && container.windows(part.len()).any(|w| w == part.as_bytes());
+        named.then_some(value)
+    });
+    lower::FORCE_CMP.set(forced);
+    let out = translate_unforced(container);
+    lower::FORCE_CMP.set(None);
+    out
+}
+
+fn translate_unforced(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_retried(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
             structure::without_live_quads(|| translate_retried(container))

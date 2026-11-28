@@ -110,6 +110,10 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"walks");
             bytes.extend_from_slice(&walks.to_le_bytes());
         }
+        if let Ok(forced) = std::env::var("VICTORY_CMP_FORCE") {
+            bytes.extend_from_slice(b"cmp force");
+            bytes.extend_from_slice(forced.as_bytes());
+        }
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:

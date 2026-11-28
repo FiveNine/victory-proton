@@ -74,6 +74,25 @@ pub(crate) struct Lowered {
     pub wave_ops: bool,
 }
 
+thread_local! {
+    /// (Diagnostics) What every comparison sample of the program being
+    /// translated reads instead (`VICTORY_CMP_FORCE`, `mod.rs` `translate`).
+    pub(crate) static FORCE_CMP: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether [`Lower::memory_waterfall`] gives its body one view for the wave
+/// (a loop over `WaveReadLaneFirst`). The loop first built left to its body,
+/// so the host's compiler ran the body once, after the loop, for all lanes,
+/// and took the view of the first lane for every lane (the view is declared
+/// uniform). Lanes whose page lies in another copy then read and
+/// wrote that first lane's copy at their own offsets: of the builder's
+/// starting stage, one thread a structure, the first row's header always
+/// landed and the rows in other copies never did (trace of 2026-11-28: row 0
+/// 119 of 119, rows 1 to 15 about 6 in 10; with a view per lane all of them,
+/// and the instances of the title's scene with a whole structure went from
+/// 6 to 957). The loop now holds its body; off, each lane has its own view.
+const WATERFALL_SHARED: bool = true;
+
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
     pub p: &'a Program,
@@ -12478,7 +12497,12 @@ impl<'a> Lower<'a> {
                     } else {
                         "sampleCmpLevelZero.f32"
                     };
-                    call_sample(self, name, op, &args, &mut gathered)
+                    let r = call_sample(self, name, op, &args, &mut gathered);
+                    if let Some(v) = FORCE_CMP.get() {
+                        let k = self.s.m.f32(v.to_bits());
+                        gathered = Some([k; 4]);
+                    }
+                    r
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
