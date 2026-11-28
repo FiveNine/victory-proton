@@ -105,8 +105,16 @@ const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
 /// pages there are in the first seconds (run light-4).
+///
+/// In all it was 2,048 while structures were not right: the bound was met in
+/// the first minute and what rays touched after it had no copy for the rest
+/// of the run (165 pages a frame, each a hole in the scene for that ray).
+/// With lanes reading their own copies (`victory-shader`, translator version
+/// 14) a run asks for about 3,200 in three minutes and then little more, and
+/// what is left without a copy is about 30 pages a frame that are not the
+/// title's memory at all (2026-11-28).
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 2048;
+const FAULTS_ALL: usize = 16384;
 
 /// Pages taken from the faults in all (`VICTORY_BVH_FAULTS_ALL=<n>`; unset:
 /// [`FAULTS_ALL`]). With ray tracing the bound is met in the first minute
@@ -1757,11 +1765,22 @@ mod stages {
     }
 
     fn set() -> Option<(u64, usize)> {
-        static SET: std::sync::OnceLock<Option<(u64, usize)>> = std::sync::OnceLock::new();
+        settings().map(|s| (s.0, s.1))
+    }
+
+    /// `VICTORY_BVH_STAGES=<frames>,<frames>[,<structures>]`: the third, how
+    /// many structures the instances name are watched once a frame for the
+    /// rest of the run (unset: 160).
+    fn settings() -> Option<(u64, usize, usize)> {
+        static SET: std::sync::OnceLock<Option<(u64, usize, usize)>> = std::sync::OnceLock::new();
         *SET.get_or_init(|| {
             let v = std::env::var("VICTORY_BVH_STAGES").ok()?;
             let mut n = v.split(',').map(|x| x.trim().parse::<u64>().ok());
-            Some((n.next().flatten()?, n.next().flatten().unwrap_or(16) as usize))
+            Some((
+                n.next().flatten()?,
+                n.next().flatten().unwrap_or(16) as usize,
+                n.next().flatten().unwrap_or(160) as usize,
+            ))
         })
     }
 
@@ -1810,7 +1829,7 @@ mod stages {
             let known = self.stages.seen.contains(&at);
             tracing::info!("bvh stage: instance names {at:#x} from frame {frame} written-before={known}");
             // The first of the builder's own: watched for the rest of the run.
-            if self.stages.long.len() < 160 && (0xd9..0xdd).contains(&(at >> 28)) && frame >= self.stages.began + long_after as u64 {
+            if self.stages.long.len() < settings().map_or(160, |s| s.2) && (0xd9..0xdd).contains(&(at >> 28)) && frame >= self.stages.began + long_after as u64 {
                 self.stages.long.push(at);
             } else {
                 self.stages.recent.push((at, frame));
@@ -1863,15 +1882,22 @@ mod stages {
             if first {
                 which.extend(self.stages.long.iter().map(|&at| (at, false)));
             }
-            // `VICTORY_BVH_STAGE_OF=<hash>`: every dispatch of that stage, what
-            // it is given to write (a clone's source and target).
+            // `VICTORY_BVH_STAGE_OF=<hash>[,<hash>...]`: every dispatch of those
+            // stages, what each is given to write (a clone's source and target).
             static OF: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
             if let Some(of) = OF.get_or_init(|| std::env::var("VICTORY_BVH_STAGE_OF").ok())
-                && STAGE.lock().unwrap_or_else(|e| e.into_inner()).contains(of.as_str())
+                && of.split(',').any(|o| !o.is_empty() && STAGE.lock().unwrap_or_else(|e| e.into_inner()).contains(o))
             {
                 which.extend(written.iter().filter(|&&w| w >= 1 << 32).map(|&w| (w, true)));
+                // At a clone: the slot its source's compacted size was asked
+                // into, as the card holds it.
+                if let [from, _] = *written
+                    && let Some(&slot) = self.size_slots.get(&from)
+                {
+                    which.push((slot, true));
+                }
             }
-            if which.is_empty() || self.stages.next + which.len() as u32 > SLOTS {
+            if which.is_empty() {
                 return;
             }
             if self.stages.to.is_none() {
@@ -1918,8 +1944,9 @@ mod stages {
                     Some(held) => (held.at as u64 - shadow.span().0) + at % PAGE,
                     None => at - shadow.span().0,
                 };
-                let slot = self.stages.next;
-                self.stages.next += 1;
+                // (A ring: a slot is read 8 frames after it is written.)
+                let slot = self.stages.next % SLOTS;
+                self.stages.next = self.stages.next.wrapping_add(1);
                 // SAFETY: an open list; live buffers; 64 bytes inside both.
                 unsafe {
                     list.list.ResourceBarrier(&[turn(&shadow.buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
@@ -1957,6 +1984,14 @@ mod dump {
         /// many, the frame (a dispatch with both addresses and a count in its
         /// constants).
         pub(super) tops: HashMap<u64, (u64, u32, u64)>,
+        /// The instances of each top-level build as title memory held them
+        /// when the copies were recorded: the structure, where they are, how
+        /// many, the frame it was last built in, the bytes. (Read when the
+        /// dump is written, 12 frames later, a structure built or moved in
+        /// between looked like one the instances name and that is not there.)
+        pub(super) taken: Vec<(u64, u64, u32, u64, Vec<u8>)>,
+        /// The frame the copies were recorded in.
+        pub(super) taken_at: u64,
         /// The frame it is written at, and the copies.
         due: Option<(u64, Vec<(ID3D12Resource, usize)>)>,
         done: bool,
@@ -1968,6 +2003,10 @@ mod dump {
                 self.walked.extend(addresses);
             }
         }
+    }
+
+    fn text_frame(dump: &mut Dump, frame: u64) {
+        dump.taken_at = frame;
     }
 
     fn folder() -> Option<&'static std::path::PathBuf> {
@@ -2014,15 +2053,12 @@ mod dump {
                 for a in &self.dump.descs.1 {
                     text += &format!("desc {a:#x} {}\n", self.dump.descs.0);
                 }
-                for (dest, (at, n, frame)) in &self.dump.tops {
-                    let mut bytes = vec![0u8; *n as usize * 64];
-                    for (i, piece) in bytes.chunks_mut(PIECE).enumerate() {
-                        crate::host::copy_mapped(piece.as_mut_ptr(), (*at as usize + i * PIECE) as *const u8, piece.len(), false);
-                    }
+                for (dest, at, n, frame, bytes) in &self.dump.taken {
                     let _ = std::fs::write(folder.join(format!("instances-{dest:x}.bin")), bytes);
                     let buffer = crate::shadow::in_buffer(*at, 1);
                     text += &format!("top {dest:#x} {at:#x} {n} {frame} {buffer:x?}\n");
                 }
+                text += &format!("taken {}\n", self.dump.taken_at);
                 text += &format!("frame {}\n", self.frame);
                 for (page, held) in &self.pages {
                     let arena = self.arenas.iter().position(|a| a.0 == held.copy).unwrap_or(usize::MAX);
@@ -2058,6 +2094,19 @@ mod dump {
                 list.keep(&to);
                 copies.push((to, data as usize));
             }
+            self.dump.taken = self
+                .dump
+                .tops
+                .iter()
+                .map(|(&dest, &(at, n, frame))| {
+                    let mut bytes = vec![0u8; n as usize * 64];
+                    for (i, piece) in bytes.chunks_mut(PIECE).enumerate() {
+                        crate::host::copy_mapped(piece.as_mut_ptr(), (at as usize + i * PIECE) as *const u8, piece.len(), false);
+                    }
+                    (dest, at, n, frame, bytes)
+                })
+                .collect();
+            text_frame(&mut self.dump, self.frame);
             self.dump.due = Some((self.frame + 12, copies));
         }
     }
