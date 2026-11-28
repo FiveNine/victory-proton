@@ -43,6 +43,12 @@ pub(super) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPIES_IN_PLACE").is_none_or(|v| v != "0"))
 }
 
+#[cfg(feature = "diagnostics")]
+fn stale_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_COPIES").is_some_and(|v| v == "1"))
+}
+
 /// The most bytes copied out of memory shaders do not write.
 const MOST: usize = 8 << 20;
 
@@ -240,6 +246,22 @@ impl HostList {
             return false;
         };
         let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+            // (Diagnostics) A copy out of memory shaders write into memory
+            // with no host copy: done at submission on the CPU, before the
+            // submission's shaders ran (`VICTORY_STALE_COPIES=1`: logged).
+            #[cfg(feature = "diagnostics")]
+            if stale_copies() && shaders_own(src, len).is_some() {
+                static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 400 {
+                    tracing::info!(
+                        frame = crate::frame::current(),
+                        src = format_args!("{src:#x}"),
+                        dst = format_args!("{dst:#x}"),
+                        len,
+                        "stale copy: out of memory shaders write, into memory with no host copy, done at submission"
+                    );
+                }
+            }
             return false;
         };
         let own = shaders_own(src, len);

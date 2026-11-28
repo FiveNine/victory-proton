@@ -3254,6 +3254,20 @@ impl State {
             .flatten();
         let threads = [x, y, z];
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // (Diagnostics, `VICTORY_BVH_DISPATCHES=1`) the builder's dispatches as given
+        // and as sent: whether a stage runs the groups its work needs.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) && std::env::var_os("VICTORY_BVH_DISPATCHES").is_some() {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 20000 {
+                tracing::info!(
+                    "bvh dispatch: frame {} {} given {threads:?} flags {flags:#x} group {size:?} sent {:?}",
+                    crate::frame::current(),
+                    p.name,
+                    [x, y, z]
+                );
+            }
+        }
         if size.is_some() {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
@@ -4641,6 +4655,16 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        // (Diagnostics) Which of the builder's stages run indirectly.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::memory::note_stage(&p.name);
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.get_or_insert_with(Default::default).insert(p.name.clone()) {
+                tracing::info!(stage = p.name, kind, stride, max, count = count.is_some(), "builder stage run indirectly");
+            }
+        }
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the

@@ -138,26 +138,75 @@ impl Inst {
 /// title's scene decayed from one of its scene changes to the next).
 ///
 /// The program computes the byte count in `s26` (`s_lshl_b32 s26, s24, 6`,
-/// `s_add_i32 s26, s26, 64`) and its copy loop, entered at the second of
-/// three `s_nop`s, compares against it each round. The last two `s_nop`s
-/// become `s_lshr_b32 s27, s24, 20` (SCC: the count is 2^20 nodes, 64 MiB,
-/// or more) and `s_cselect_b32 s26, 0, s26`: such a clone ends after its
-/// first round (each thread's first 16 bytes, 256 KiB in all at most).
+/// `s_add_i32 s26, s26, 64`) and leaves out the lanes whose first 16 bytes
+/// lie past it (`v_cmpx_gt_u32`) before its copy loop. Those two words
+/// become a branch to four words put after the program's end, which compute
+/// the count as before and then set it to 0 when the node count is 2^20
+/// (64 MiB) or more (`s_lshr_b32 s27, s24, 20`, `s_cselect_b32 s26, 0,
+/// s26`), and a branch back: such a clone copies nothing. (A first bound
+/// set the count to 0 inside the loop, after its first round: every lane
+/// had copied its 16 bytes, 256 KiB of the source's garbage behind the
+/// target.)
 fn bound_clone(code: &[u8]) -> Option<Vec<u8>> {
     const COUNT: [u32; 3] = [0x8F1A_8618, 0x811A_C01A, 0x7DA8_021A];
     const NOP: u32 = 0xBF80_0000;
+    const BRANCH: u32 = 0xBF82_0000;
     const BOUND: [u32; 2] = [0x901B_9418, 0x851A_1A80];
     let word = |i: usize| code.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let at = (0..code.len() / 4).find(|&i| (0..3).all(|k| word(i + k) == Some(COUNT[k])))?;
-    // (The loop's head: its entry is the branch to the second nop.)
-    if (12..=14).any(|k| word(at + k) != Some(NOP)) {
+    // (The loop's head, as this program has it: the entry is the branch to
+    // the second of three nops.)
+    if (12..=14).any(|k| word(at + k) != Some(NOP)) || code.len() % 4 != 0 {
         return None;
     }
-    let mut out = code.to_vec();
-    for (k, w) in BOUND.iter().enumerate() {
-        out[(at + 13 + k) * 4..(at + 14 + k) * 4].copy_from_slice(&w.to_le_bytes());
+    let branch = |from: usize, to: usize| BRANCH | u32::from((to as i64 - from as i64 - 1) as i16 as u16);
+    let end = code.len() / 4;
+    let mut words: Vec<u32> = (0..end).map(|i| word(i).unwrap_or(NOP)).collect();
+    words[at] = branch(at, end);
+    words[at + 1] = NOP;
+    words.extend([COUNT[0], COUNT[1], BOUND[0], BOUND[1]]);
+    words.push(branch(end + 4, at + 2));
+    Some(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::bound_clone;
+
+    /// The words around the clone's count, as the program has them, with
+    /// an end after them.
+    fn program() -> Vec<u8> {
+        let mut w = vec![0xBE82_0300u32; 4];
+        w.extend([0x8F1A_8618, 0x811A_C01A, 0x7DA8_021A, 0xBF88_0015]);
+        w.extend([0xBF80_0000; 8]);
+        w.extend([0xBF80_0000; 3]);
+        w.extend([0xBF81_0000]);
+        w.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
-    Some(out)
+
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    #[test]
+    fn the_count_is_computed_after_the_end_and_bounded_before_the_lanes_are_picked() {
+        let out = words(&bound_clone(&program()).expect("the clone's count"));
+        let (at, end) = (4, 20);
+        // A branch forward to the end, and one back to the lanes' compare.
+        assert_eq!(out[at], 0xBF82_0000 | (end - at - 1) as u32);
+        assert_eq!(out[at + 1], 0xBF80_0000);
+        assert_eq!(&out[end..end + 4], &[0x8F1A_8618, 0x811A_C01A, 0x901B_9418, 0x851A_1A80]);
+        assert_eq!(out[end + 4], 0xBF82_0000 | u32::from(((at + 2) as i64 - (end + 4) as i64 - 1) as i16 as u16));
+        assert_eq!(out[at + 2], 0x7DA8_021A);
+        assert_eq!(out.len(), end + 5);
+    }
+
+    #[test]
+    fn another_program_is_left_alone() {
+        let mut p = program();
+        p[16] ^= 1;
+        assert!(bound_clone(&p).is_none());
+    }
 }
 
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR

@@ -155,6 +155,65 @@ fn persist() -> (u32, usize) {
 /// a structure built once kept the holes (dumps of 2026-11-28: of the
 /// instances of structures built at run time 108 named a whole one, 522 one
 /// without its header).
+/// `VICTORY_BVH_GEOMETRY=0`: the index and vertex buffers the leaf
+/// unpacking stage reads are not made ready (as before).
+fn geometry_ready() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_GEOMETRY").is_none_or(|v| v != "0"))
+}
+
+/// (Diagnostics) the first tables read are logged.
+#[cfg(feature = "diagnostics")]
+fn geometry_said() -> bool {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40
+}
+
+/// The geometry records at `table` in title memory, while they look like
+/// D3D12 triangle records (48 bytes: transform, index format, vertex
+/// format, index count, vertex count, index buffer, vertex buffer, stride;
+/// the leaf stage's third view, as 0x134850000 in run geo3):
+/// each one's index buffer and its bytes (0 without one) and vertex buffer
+/// and its bytes.
+fn geometry_records(table: u64) -> Vec<(u64, u64, u64, u64)> {
+    const RECORD: usize = 48;
+    const MOST: usize = 1024;
+    const BIGGEST: u64 = 64 << 20;
+    let title = |a: u64| (1 << 32..1 << 40).contains(&a);
+    let mut out = Vec::new();
+    let mut bytes = [0u8; RECORD];
+    for i in 0..MOST {
+        crate::host::copy_mapped(bytes.as_mut_ptr(), (table as usize + i * RECORD) as *const u8, RECORD, false);
+        let d = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let q = |at: usize| u64::from(d(at)) | u64::from(d(at + 4)) << 32;
+        let (index_format, vertex_format, indices, vertices) = (d(8), d(12), u64::from(d(16)), u64::from(d(20)));
+        let (ib, vb, stride) = (q(24), q(32), q(40));
+        // The title's records carry the console's own format codes (0x35 for
+        // its 16-bit indices, run geo3); the program takes 42 (R32_UINT) for
+        // 32-bit indices and any other for 16-bit ones. A record past the
+        // last has no buffers.
+        let index_size = match (index_format, ib) {
+            (_, 0) => 0,
+            (42, _) => 4,
+            _ => 2,
+        };
+        let _ = vertex_format;
+        if !title(vb)
+            || !(4..=256).contains(&stride)
+            || vertices == 0
+            || vertices >= 1 << 24
+            || indices >= 1 << 26
+            || (index_size > 0 && (!title(ib) || indices == 0))
+        {
+            break;
+        }
+        let ib_len = (indices * index_size).min(BIGGEST);
+        let vb_len = (vertices * stride).min(BIGGEST);
+        out.push((if index_size > 0 { ib } else { 0 }, if index_size > 0 { ib_len } else { 0 }, vb, vb_len));
+    }
+    out
+}
+
 fn named_len() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -334,6 +393,9 @@ struct Stats {
     packed: u64,
     packed_bytes: u64,
     gone: u64,
+    /// Geometry records whose index and vertex buffers were made ready for
+    /// the leaf unpacking stage.
+    geometry: u64,
     /// Pages that came for an address in constants, a written view, another
     /// view, a structure named in upload memory.
     came: [u64; 4],
@@ -1079,6 +1141,9 @@ impl Memory {
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
+        if s.geometry > 0 {
+            tracing::info!(records = s.geometry, "title memory by address: index and vertex buffers made ready for the leaf unpacking stage since the last line");
+        }
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
@@ -1277,6 +1342,8 @@ pub(crate) fn ready(
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
         #[cfg(feature = "diagnostics")]
+        crate::slottrap::frame();
+        #[cfg(feature = "diagnostics")]
         m.stages_look(frame);
     }
     #[cfg(feature = "diagnostics")]
@@ -1297,6 +1364,8 @@ pub(crate) fn ready(
         }
         m.size_slots.insert(u64::from(lo) | u64::from(hi) << 32, slot);
         m.know(u64::from(lo) | u64::from(hi) << 32);
+        #[cfg(feature = "diagnostics")]
+        crate::slottrap::arm(slot, u64::from(lo) | u64::from(hi) << 32, frame);
     }
     if builds
         && threads == Some([32, 1, 1])
@@ -1338,6 +1407,51 @@ pub(crate) fn ready(
             let at = u64::from(c) << 8;
             if named(1, at) {
                 m.ready(at, named_len());
+            }
+        }
+    }
+    // The builder's stage that unpacks a streamed structure's leaves (groups
+    // of 1,024 threads, 2,048 leaves a group): it reads each triangle's
+    // indices and corners from the title's own index and vertex buffers,
+    // through 48-byte geometry records (as D3D12's triangles: transform,
+    // index format, vertex format, index count, vertex count, index buffer,
+    // vertex buffer and stride). No view names those buffers, so in the
+    // builder's first frames, when it unpacks hundreds of structures, most
+    // of their pages had no copy: the reads gave 0, the corners came out at
+    // one point, and the unpacking is not done again (run wall3: 498 of
+    // 1,805 structures, the house's walls and floors among them, with most
+    // leaves so). The records are the title's CPU's: what they name is made
+    // ready here.
+    // (Its constants: three zeros, the count, the three axes' scales, 1.)
+    if builds
+        && threads == Some([1024, 1, 1])
+        && geometry_ready()
+        && let [0, 0, 0, _, _, _, _, 1, ..] = *constants
+    {
+        for &table in addresses {
+            if table < 1 << 32 || table >= 1 << 40 || table & 7 != 0 || !named(3, table) {
+                continue;
+            }
+            let records = geometry_records(table);
+            #[cfg(feature = "diagnostics")]
+            if m.stages_on() || geometry_said() {
+                let text: Vec<String> = records.iter().take(4).map(|g| format!("ib {:#x}+{:#x} vb {:#x}+{:#x}", g.0, g.1, g.2, g.3)).collect();
+                let mut raw = [0u32; 24];
+                crate::host::copy_mapped(raw.as_mut_ptr().cast(), table as *const u8, 96, false);
+                let raw: Vec<String> = raw.iter().map(|w| format!("{w:08x}")).collect();
+                tracing::info!(
+                    "bvh geometry: frame {frame} table {table:#x} of views {addresses:x?} constants {constants:x?}: {} records; {}; raw {}",
+                    records.len(),
+                    text.join(", "),
+                    raw.join(" ")
+                );
+            }
+            for (ib, ib_len, vb, vb_len) in records {
+                if ib_len > 0 {
+                    m.ready(ib, ib_len);
+                }
+                m.ready(vb, vb_len);
+                m.stats.geometry += 1;
             }
         }
     }
@@ -1992,6 +2106,10 @@ mod dump {
         pub(super) taken: Vec<(u64, u64, u32, u64, Vec<u8>)>,
         /// The frame the copies were recorded in.
         pub(super) taken_at: u64,
+        /// Packed (streamed) structures as title memory held them when the
+        /// copies were recorded: to compare with the card's (pages the card
+        /// holds as zeros that title memory filled).
+        pub(super) titles: Vec<(u64, Vec<u8>)>,
         /// The frame it is written at, and the copies.
         due: Option<(u64, Vec<(ID3D12Resource, usize)>)>,
         done: bool,
@@ -2053,6 +2171,9 @@ mod dump {
                 for a in &self.dump.descs.1 {
                     text += &format!("desc {a:#x} {}\n", self.dump.descs.0);
                 }
+                for (a, bytes) in &self.dump.titles {
+                    let _ = std::fs::write(folder.join(format!("title-{a:x}.bin")), bytes);
+                }
                 for (dest, at, n, frame, bytes) in &self.dump.taken {
                     let _ = std::fs::write(folder.join(format!("instances-{dest:x}.bin")), bytes);
                     let buffer = crate::shadow::in_buffer(*at, 1);
@@ -2106,6 +2227,22 @@ mod dump {
                     (dest, at, n, frame, bytes)
                 })
                 .collect();
+            // (At most 768 MB of them.)
+            let mut room: usize = 768 << 20;
+            let mut titles = Vec::new();
+            for (&a, p) in &self.packed {
+                let len = p.len as usize;
+                if len > room {
+                    continue;
+                }
+                room -= len;
+                let mut bytes = vec![0u8; len];
+                for (i, piece) in bytes.chunks_mut(PIECE).enumerate() {
+                    crate::host::copy_mapped(piece.as_mut_ptr(), (a as usize + i * PIECE) as *const u8, piece.len(), false);
+                }
+                titles.push((a, bytes));
+            }
+            self.dump.titles = titles;
             text_frame(&mut self.dump, self.frame);
             self.dump.due = Some((self.frame + 12, copies));
         }

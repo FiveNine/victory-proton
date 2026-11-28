@@ -869,6 +869,8 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::slottrap::copied(from as usize, to as usize, len, "buffer");
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
     } else {
